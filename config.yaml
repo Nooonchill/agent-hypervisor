@@ -1,0 +1,32 @@
+version: 1
+agents-dir: examples/agents
+
+agents:
+  - agent-id: spec-writer
+    agent-name: Spec Writer
+    model: null
+    reviewer-id: architect
+    create-pr: false
+
+  - agent-id: developer
+    agent-name: Developer
+    model: null
+    reviewer-id: architect
+    create-pr: false
+
+  - agent-id: architect
+    agent-name: Architect
+    model: null
+    reviewer-id: null
+    create-pr: false
+
+flow:
+  - id: specification
+    agent-id: spec-writer
+    goal: Describe the task requirements and acceptance criteria.
+  - id: design
+    agent-id: architect
+    goal: Review the specification and describe the implementation approach.
+  - id: implementation
+    agent-id: developer
+    goal: Implement the agreed changes and verify the acceptance criteria.
