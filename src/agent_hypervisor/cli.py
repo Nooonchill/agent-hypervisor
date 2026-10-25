@@ -8,13 +8,14 @@ from pathlib import Path
 
 from .diagnostics import configure_diagnostics, read_log_tail
 from .models import GroupStatus, HypervisorError
-from .project_config import load_project_config
+from .project_config import ProjectConfig, load_project_config
 from .tmux import TmuxBackend
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="hypervisor", description="Manage Qwen Code terminals in tmux worktrees"
+        prog="hypervisor",
+        description="Manage task groups, sequential workflows, and Qwen Code terminals",
     )
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
     parser.add_argument("--config", type=Path, help="YAML configuration (default: ./config.yaml)")
@@ -24,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     logs = subparsers.add_parser("logs", help="show recent diagnostic log entries")
     logs.add_argument("--lines", type=int, default=100)
     subparsers.add_parser(
-        "check-config", help="validate agent definitions and flow without starting Qwen"
+        "check-config", help="validate agent definitions and named workflows without starting Qwen"
     )
     create = subparsers.add_parser("create", help="create a task group with configured agents")
     create.add_argument("group_id")
@@ -32,6 +33,23 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--agent-command", help="command launched in every terminal")
     create.add_argument(
         "--type", dest="task_type", default="feature", help="branch type, e.g. feature, fix, docs"
+    )
+    create.add_argument("--flow", help="named workflow to snapshot into the new task group")
+    create.add_argument("--request", help="initial task request (default from task-form)")
+    create.add_argument("--goal", help="shared task goal (default from task-form)")
+    create.add_argument(
+        "--source", action="append", help="source path or URL (repeatable; default from task-form)"
+    )
+    create.add_argument(
+        "--constraint",
+        "--constraints",
+        dest="constraints",
+        help="additional shared constraints",
+    )
+    create.add_argument(
+        "--start-workflow",
+        action="store_true",
+        help="deliver the first workflow prompt after creating the group",
     )
 
     subparsers.add_parser("list", help="list groups")
@@ -53,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "start":
             command.add_argument("--session", help="resume this managed Qwen session UUID")
 
-    send = subparsers.add_parser("send", help="send a prompt followed by Enter")
+    send = subparsers.add_parser("send", help="queue a prompt with Ctrl+Q")
     send.add_argument("group_id")
     send.add_argument("terminal", help="agent-id or terminal number")
     send.add_argument("text")
@@ -79,6 +97,82 @@ def build_parser() -> argparse.ArgumentParser:
     sessions = subparsers.add_parser("sessions", help="list Qwen sessions for one terminal")
     sessions.add_argument("group_id")
     sessions.add_argument("terminal", help="agent-id or terminal number")
+
+    mode = subparsers.add_parser("mode", help="pause or restore automatic tasks for one agent")
+    mode.add_argument("group_id")
+    mode.add_argument("terminal", help="agent-id or terminal number")
+    mode.add_argument("mode", choices=("manual", "workflow"))
+    mode.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+
+    workflow = subparsers.add_parser("workflow", help="inspect or advance a task workflow")
+    workflow_commands = workflow.add_subparsers(dest="workflow_command", required=True)
+    for name, help_text in (
+        ("status", "show workflow state"),
+        ("start", "start the first workflow stage"),
+        ("resume", "explicitly resume a workflow after interruption"),
+        ("events", "show workflow events"),
+    ):
+        command = workflow_commands.add_parser(name, help=help_text)
+        command.add_argument("group_id")
+        if name == "resume":
+            command.add_argument(
+                "--retry-delivery",
+                action="store_true",
+                help="explicitly resend an uncertain prompt",
+            )
+        command.add_argument(
+            "--json",
+            dest="json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="print machine-readable JSON",
+        )
+    report = workflow_commands.add_parser("report", help="read a workflow report")
+    report.add_argument("group_id")
+    report.add_argument("path", help="report path recorded in workflow events")
+    report.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="wrap report content in machine-readable JSON",
+    )
+
+    stage = subparsers.add_parser("stage", help="submit a workflow stage")
+    stage_sub = stage.add_subparsers(dest="stage_command", required=True)
+    complete = stage_sub.add_parser("complete", help="submit a stage for checks and review")
+    complete.add_argument("group_id")
+    complete.add_argument("step_id")
+    complete.add_argument("--attempt", required=True)
+    complete.add_argument("--session", required=True)
+    complete.add_argument("--summary", required=True)
+    complete.add_argument("--json", dest="json", action="store_true", default=argparse.SUPPRESS)
+
+    review = subparsers.add_parser("review", help="submit an independent review decision")
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+    submit = review_sub.add_parser("submit", help="submit review decision and findings")
+    submit.add_argument("group_id")
+    submit.add_argument("step_id")
+    submit.add_argument("--attempt", required=True)
+    submit.add_argument("--session", required=True)
+    submit.add_argument(
+        "--decision", required=True, choices=("approved", "changes_requested", "blocked")
+    )
+    submit.add_argument("--summary", required=True)
+    submit.add_argument(
+        "--finding", action="append", default=[], help="concrete finding (repeatable)"
+    )
+    submit.add_argument("--json", dest="json", action="store_true", default=argparse.SUPPRESS)
+
+    human = subparsers.add_parser("human", help="record a human workflow decision")
+    human_sub = human.add_subparsers(dest="human_command", required=True)
+    for name in ("approve", "reject"):
+        decision = human_sub.add_parser(name, help=f"{name} the current stage")
+        decision.add_argument("group_id")
+        decision.add_argument("step_id")
+        decision.add_argument("--attempt", required=True)
+        decision.add_argument("--comment", required=name == "reject", default="")
+        decision.add_argument("--json", dest="json", action="store_true", default=argparse.SUPPRESS)
     return parser
 
 
@@ -107,6 +201,13 @@ def _print_group(group: GroupStatus, as_json: bool) -> None:
         print(f"  {label}: {terminal.state.value}{details}")
 
 
+def _print_workflow(value: object, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(value, ensure_ascii=False))
+    else:
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -114,20 +215,23 @@ def main(argv: list[str] | None = None) -> int:
         print(read_log_tail(args.lines))
         return 0
     try:
-        project_config = load_project_config(args.config)
+        reads_yaml = args.command in (None, "tui", "check-config", "create")
+        project_config = load_project_config(args.config) if reads_yaml else ProjectConfig.default()
         if args.command == "check-config":
             if args.json:
                 print(json.dumps(asdict(project_config), ensure_ascii=False))
             else:
                 print(
-                    f"Configuration OK: {len(project_config.agents)} agents, {len(project_config.flow)} flow steps"
+                    f"Configuration OK: {len(project_config.agents)} agents, {len(project_config.flows)} workflows"
                 )
                 for agent in project_config.agents:
                     print(
                         f"  {agent.agent_id}: {agent.agent_name}  model={agent.model or 'default'}"
                     )
-                for step in project_config.flow:
-                    print(f"  {step.step_id} -> {step.agent_id}: {step.goal}")
+                for flow in project_config.flows:
+                    print(f"  {flow.flow_id}: {flow.name}")
+                    for step in flow.steps:
+                        print(f"    {step.step_id} -> {step.agent_id}: {step.goal}")
             return 0
         if args.command == "create" and args.agent_command:
             import shlex
@@ -155,9 +259,20 @@ def main(argv: list[str] | None = None) -> int:
             HypervisorApp(backend=backend).run()
             return 0
         if args.command == "create":
-            _print_group(
-                backend.create_group(args.group_id, args.cwd, task_type=args.task_type), args.json
+            group = backend.create_group(
+                args.group_id,
+                args.cwd,
+                task_type=args.task_type,
+                flow_id=args.flow,
+                request=args.request,
+                goal=args.goal,
+                sources=tuple(args.source) if args.source is not None else None,
+                constraints=args.constraints,
             )
+            if args.start_workflow:
+                _print_workflow(backend.workflow.start(args.group_id), args.json)
+            else:
+                _print_group(group, args.json)
         elif args.command == "list":
             groups = backend.list_groups()
             if args.json:
@@ -181,6 +296,10 @@ def main(argv: list[str] | None = None) -> int:
             _print_group(backend.status(args.group_id), args.json)
         elif args.command == "send":
             backend.send_text(args.group_id, args.terminal, args.text, not args.no_enter)
+        elif args.command == "mode":
+            _print_workflow(
+                backend.workflow.set_agent_mode(args.group_id, args.terminal, args.mode), args.json
+            )
         elif args.command == "key":
             backend.send_key(args.group_id, args.terminal, args.key)
         elif args.command == "capture":
@@ -209,6 +328,62 @@ def main(argv: list[str] | None = None) -> int:
                         f"{session.session_id}\tcreated={session.created_at}"
                         f"\tlast_started={session.last_started_at}"
                     )
+        elif args.command == "workflow":
+            service = backend.workflow
+            subcommand = args.workflow_command
+            if subcommand == "status":
+                _print_workflow(service.status(args.group_id), args.json)
+            elif subcommand == "start":
+                _print_workflow(service.start(args.group_id), args.json)
+            elif subcommand == "resume":
+                _print_workflow(
+                    service.resume(args.group_id, retry_delivery=args.retry_delivery), args.json
+                )
+            elif subcommand == "events":
+                _print_workflow(service.events(args.group_id), args.json)
+            elif subcommand == "report":
+                content = service.report(args.group_id, args.path)
+                if args.json:
+                    print(json.dumps({"path": args.path, "content": content}, ensure_ascii=False))
+                else:
+                    print(content, end="" if content.endswith("\n") else "\n")
+        elif args.command == "stage" and args.stage_command == "complete":
+            _print_workflow(
+                backend.workflow.complete(
+                    args.group_id,
+                    args.step_id,
+                    args.attempt,
+                    args.summary,
+                    session_id=args.session,
+                ),
+                args.json,
+            )
+        elif args.command == "review" and args.review_command == "submit":
+            _print_workflow(
+                backend.workflow.submit_review(
+                    args.group_id,
+                    args.step_id,
+                    args.attempt,
+                    args.decision,
+                    args.summary,
+                    findings=args.finding,
+                    session_id=args.session,
+                ),
+                args.json,
+            )
+        elif args.command == "human":
+            if args.human_command == "reject" and not args.comment.strip():
+                raise HypervisorError("Reject requires a non-empty comment")
+            _print_workflow(
+                backend.workflow.human_decision(
+                    args.group_id,
+                    args.step_id,
+                    args.attempt,
+                    approved=args.human_command == "approve",
+                    comment=args.comment,
+                ),
+                args.json,
+            )
         return 0
     except HypervisorError as error:
         if args.json:

@@ -47,3 +47,11 @@ class GroupStatus:
 
 class HypervisorError(RuntimeError):
     """A user-facing error from tmux or invalid hypervisor state."""
+
+
+class AgentManualMode(HypervisorError):
+    """Automatic prompt delivery was deliberately paused by the user."""
+
+
+class WorkflowBusy(HypervisorError):
+    """Another process currently owns the task's workflow transition."""

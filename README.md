@@ -30,6 +30,31 @@ uv run hypervisor
 - `F11` / `Ctrl+Shift+C` — скопировать выделенный текст;
 - `F7` — запустить заново, `F8` — остановить, `F12` — закрыть только TUI.
 
+Start/Stop и переключатель режима находятся в одной строке с названием и статусом терминала.
+Roadmap внутри шапки группы занимает всю её ширину: каждый участок между
+точками — этап. Ожидающий путь белый, завершённый — зелёный сплошной, текущий — зелёный
+пунктирный. Наведение показывает название и состояние; нажатие открывает детали этапа.
+Метка `◈` обозначает ручное подтверждение. После выбора дорожки стрелки `←` / `→`
+переключают этапы, `Enter` открывает детали. Длина пути подстраивается под размер окна.
+
+Рядом со Start/Stop каждого выбранного агента находится переключатель **◇ / ◆**.
+**◆ и подпись MANUAL** означают ручной режим: новые автоматические промпты этому агенту
+не поступают, сессия и текущая работа продолжаются. Ожидающее задание сохраняется в журнале,
+roadmap показывает `Manual control`. Повторное нажатие возвращает агента в workflow и доставляет
+отложенное задание без новой попытки этапа. Другие агенты сохраняют свои режимы.
+Перед возвратом отправьте или очистите незавершённый промпт: переключатель не меняет черновик.
+Уже отправленные в Qwen задания не отменяются. Режим сохраняется после закрытия TUI.
+
+То же управление без интерфейса:
+
+```bash
+uv run hypervisor mode TASK-123 developer manual
+uv run hypervisor mode TASK-123 developer workflow
+```
+
+Автоматические вызовы `send` также учитывают ручной режим; прямой ввод клавиш пользователем
+остаётся доступен. Для групп без настроенного workflow переключатель не нужен и недоступен.
+
 Текст в терминалах и подписях Hypervisor можно выделять перетаскиванием мыши.
 При отпускании кнопки мыши выделение копируется автоматически. Выделенная терминальная панель
 сохраняет снимок до снятия выделения кликом, чтобы новый вывод не менял читаемый текст.
@@ -55,7 +80,10 @@ Qwen использует собственную Virtualized History, поэто
 
 ```bash
 uv run hypervisor check-config
-uv run hypervisor create 123 --type feature
+uv run hypervisor create 123 --type feature --request "Описать задачу и реализовать изменения"
+uv run hypervisor create PROJ-123 --flow intent-implementation \
+  --request "Добавить экспорт" --goal "Реализовать экспорт по требованиям" \
+  --source openspec/intent.md --constraint "Сохранить обратную совместимость"
 uv run hypervisor list
 uv run hypervisor status 123
 uv run hypervisor activate 123
@@ -72,6 +100,49 @@ uv run hypervisor remove docs-123
 uv run hypervisor remove docs-123 --remove-worktree
 ```
 
+`send` добавляет промпт в очередь Qwen через `Ctrl+Q`. Терминалы можно запускать параллельно
+вручную; workflow при этом последовательно передаёт задание следующему этапу только после
+проверок и ревью. Создание группы не запускает workflow. Чтобы начать его сразу при создании,
+добавьте `--start-workflow`; для уже созданной группы используйте явную команду `workflow start`.
+
+Workflow-команды:
+
+```bash
+uv run hypervisor workflow status PROJ-123
+uv run hypervisor workflow events PROJ-123
+uv run hypervisor workflow start PROJ-123
+uv run hypervisor workflow resume PROJ-123
+uv run hypervisor workflow report PROJ-123 reports/ATTEMPT-review.json
+```
+
+Операции исполнителя, независимого ревью и ручного подтверждения доступны из CLI и могут
+вызываться пользователем из TUI. `workflow events` показывает события, в том числе текущие
+`attempt` и UUID сессии из `stage.started` или `review.started`. Их нужно передать в callback:
+
+```bash
+uv run hypervisor --json stage complete PROJ-123 implementation \
+  --attempt ATTEMPT_FROM_EVENTS --session EXECUTOR_SESSION_FROM_EVENTS \
+  --summary "Изменения реализованы; добавлен tests/test_export.py"
+
+uv run hypervisor --json review submit PROJ-123 implementation \
+  --attempt ATTEMPT_FROM_EVENTS --session REVIEWER_SESSION_FROM_EVENTS \
+  --decision approved --summary "Изменения соответствуют intent"
+
+uv run hypervisor --json human approve PROJ-123 implementation --attempt ATTEMPT_FROM_EVENTS
+uv run hypervisor --json human reject PROJ-123 implementation \
+  --attempt ATTEMPT_FROM_EVENTS --comment "Исправить обработку пустого файла"
+```
+
+Сгенерированные задания исполнителю и ревьюеру содержат соответствующую callback-команду.
+Команда завершения — только заявка: Hypervisor выполняет hard gates, затем запускает отдельное
+ревью. Для каждого этапа создаётся новая UUID-сессия ревьюера, даже если тот же агент был
+исполнителем раньше. Терминальные окна и их история сохраняются при смене роли, поэтому работающий
+агент не завершается; окна остаются до удаления группы.
+
+Если доставка промпта оборвалась между записью события и отправкой, Hypervisor не повторяет её
+молча: сначала осмотрите терминал и `workflow events`, затем при необходимости явно повторите
+команду через `workflow resume PROJ-123 --retry-delivery`.
+
 Диагностика TUI, включая события прокрутки:
 
 ```bash
@@ -87,7 +158,7 @@ Qwen-совместимые аргументы `--session-id`, `--resume` и `--
 заменить Qwen Code на совместимый GigaCode CLI без изменения управления сессиями. Например:
 
 ```bash
-HYPERVISOR_AGENT_COMMAND="gigacode" uv run hypervisor create demo
+HYPERVISOR_AGENT_COMMAND="gigacode" uv run hypervisor create demo --request "Проверить запуск GigaCode"
 ```
 
 ## Группы, worktree и сессии
@@ -98,7 +169,12 @@ HYPERVISOR_AGENT_COMMAND="gigacode" uv run hypervisor create demo
 2. создаёт скрытый соседний worktree `.<repository>-worktrees/<group>` и ветку
    `<тип>/<код задачи>`, например `fix/PROJ-123`;
 3. резервирует новый UUID Qwen-сессии для каждого агента из YAML;
-4. оставляет группу неактивной до нажатия **Activate group**.
+4. оставляет терминалы неактивными до нажатия **Activate group**.
+
+Если для группы выбран flow, его снимок и исходный запрос записываются в `events.jsonl` в
+worktree. Сам факт создания не стартует этап: начало запускается через `workflow start` или
+флаг `create --start-workflow`. Workflow выполняет этапы по порядку; ручной запуск разных
+терминалов возможен независимо от этой последовательности.
 
 При первом запуске сессии встроенная команда Qwen `/rename` задаёт имя
 `<agent-id>-<8 hex символов UUID>`, например `developer-a3f02c91`.
@@ -126,7 +202,74 @@ Worktree с незакоммиченными изменениями автома
 Контракт `HypervisorBackend` отделён от реализации `TmuxBackend`, поэтому TUI можно тестировать без tmux,
 а новые адаптеры не требуют изменения UI.
 
-## Агенты и flow в config.yaml
+## Агенты и workflow в config.yaml
+
+Подписи, обязательность и начальные значения четырёх полей формы задаются в `task-form`:
+
+```yaml
+task-form:
+  request:
+    label: Запрос задачи
+    required: true
+    default: ""
+  goal:
+    label: Общая цель
+    required: false
+    default: ""
+  sources:
+    label: Источники (через запятую)
+    required: false
+    default: [openspec/intent.md]
+  constraints:
+    label: Ограничения
+    required: false
+    default: Не менять публичный API без необходимости.
+```
+
+Внутренние ключи `request`, `goal`, `sources`, `constraints` фиксированы; меняются их подписи,
+обязательность, видимость (`visible`, по умолчанию `true`) и defaults. Для `sources` default — список строк, для остальных — строка.
+В форме обязательные поля отмечены `*`. Проверка одинакова в TUI и CLI и выполняется до создания
+worktree. В CLI пропущенный параметр берёт значение из YAML; явно заданная пустая строка очищает
+необязательное поле. Без `task-form` остаются стандартные подписи и пустые необязательные поля.
+
+Фактические значения и снимок настроек формы сохраняются в `task.created` в
+`<worktree>/.hypervisor/events.jsonl`. Пустая общая цель заполняется исходным запросом.
+Запрос, цель, источники и ограничения включаются в задания исполнителя и ревьюера; источники
+передаются как ссылки/пути, содержимое файлов автоматически не прикладывается. Задания поступают
+в Qwen через очередь Ctrl+Q. Изменения YAML действуют на новые группы.
+
+Для конкретного workflow задайте `task-form` внутри его записи в `flows`:
+
+```yaml
+flows:
+  - id: documentation
+    name: Documentation
+    task-form:
+      request:
+        label: Какие документы обновить?
+      goal:
+        visible: false
+        default: Обновить документацию по запросу.
+      sources:
+        default: [README.md]
+      constraints:
+        visible: false
+        default: Изменять только документацию.
+    steps: # обычные этапы workflow
+```
+
+Настройки наследуются по отдельным свойствам: стандартные → общий `task-form` → `flows[].task-form`.
+После выбора flow TUI показывает его форму; CLI использует те же defaults и проверки через `--flow`.
+Скрытые поля не отображаются, но их defaults попадают в начальный контекст. Скрытое обязательное поле
+должно иметь непустой default. Форма только собирает ввод: порядок работы, цели этапов и проверки
+по-прежнему задаются в `steps`.
+
+Рабочий пример с двумя разными формами:
+
+```bash
+uv run hypervisor --config examples/workflow-forms.yaml check-config
+uv run hypervisor --config examples/workflow-forms.yaml
+```
 
 По умолчанию читается `config.yaml` в текущем каталоге. Другой путь:
 
@@ -139,26 +282,34 @@ uv run hypervisor --config /path/to/config.yaml
 терминала. Явно заданный отсутствующий или неверный файл вызывает ошибку.
 
 Пример в корне репозитория содержит Spec Writer, Developer и Architect, описания — в `examples/agents/`.
-Минимальный пример:
+Минимальный пример v2 с именованным flow:
 
 ```yaml
-version: 1
+version: 2
 agents-dir: ./agents
+data-dir: .hypervisor
 agents:
   - agent-id: developer
     agent-name: Developer
-    model: null
-    reviewer-id: architect
-    create-pr: false
   - agent-id: architect
     agent-name: Architect
-flow:
-  - id: implement
-    agent-id: developer
-    goal: Реализовать согласованные изменения и запустить тесты.
-  - id: review
-    agent-id: architect
-    goal: Проверить результат и описать замечания.
+flows:
+  - id: implementation
+    name: Реализация
+    steps:
+      - id: implement
+        agent-id: developer
+        goal: Реализовать согласованные изменения и запустить тесты.
+        reviewer-id: architect
+        review-goal: Проверить результат по требованиям и найти конкретные дефекты.
+        review-scope: ["src/**", "tests/**"]
+        checks:
+          - id: unit-tests
+            command: [python, -m, unittest]
+            timeout: 300
+        auto-commit: false
+        create-pr: false
+        human-approval: false
 ```
 
 Для каждого `agent-id` требуется `<agents-dir>/<agent-id>.md`. Пути разрешаются относительно
@@ -169,12 +320,37 @@ YAML-файла. Markdown может иметь YAML frontmatter в стиле Q
 не настраивают этот отдельный процесс.
 
 `agent-id` уникален и используется для ссылок, CLI-команд и имени сессии. `agent-name` показывается
-в панели. `reviewer-id` может быть `null` или ссылаться на существующего агента. `create-pr`
-по умолчанию `false`. Flow — упорядоченный список этапов: `agent-id`, непустой `goal` и
-необязательный уникальный `id` (без него генерируется `step-1`, `step-2`, …).
+в панели. Роли и цели назначаются в каждом этапе через `agent-id`, `reviewer-id`, `goal` и
+`review-goal`; у агента нет настроек ревью или PR. У flow есть `id`, `name` и непустой список
+этапов. Идентификаторы проверяются на уникальность, ссылки — на наличие соответствующих агентов.
 
-Flow, связи ревью и флаг создания PR пока только проверяются и сохраняются. Ничего не запускается
-автоматически. Код проверяет неизвестные поля, типы, ссылки, дубли и доступность описаний до старта.
+`checks` — список hard gates. `command` — argv-массив, который запускается напрямую, без shell;
+если нужен shell, укажите его явно, например `[bash, -lc, "python -m unittest"]`. Таймаут
+задаётся положительным целым числом в секундах, по умолчанию 300. Проверки запускаются из корня
+worktree. `review-scope` — непустой список относительных путей или glob-шаблонов без `..`.
+
+При `auto-commit: false` исполнитель сам создаёт коммит перед отправкой этапа; проверки требуют
+чистый worktree и существующий HEAD. При `true` Hypervisor коммитит после успешных gates. После
+любого ревью проверяются чистота worktree и неизменность HEAD. Если ревьюер изменил файлы или
+HEAD, этап блокируется для решения человека; изменения автоматически не удаляются.
+`create-pr: true` только записывает запрос со статусом `not_integrated`; PR пока не создаётся и
+этот флаг никогда не блокирует workflow. `human-approval: true` отдельно приостанавливает этап до
+`human approve` или возврата на доработку через `human reject`.
+
+Workflow хранит источник истины состояния в `.hypervisor/events.jsonl` (или в относительном
+`data-dir` из конфигурации). Отчёты hard gates и ревью хранятся рядом в `reports/`, а события
+ссылаются на них. Hypervisor добавляет каталог данных в локальный Git `info/exclude`, не изменяя
+файлы проекта. Общий реестр групп и снимки сессий остаются в `~/.local/state/agent-hypervisor/`;
+он помогает найти worktree и восстановить терминалы, но не заменяет журнал workflow. Данные
+workflow и отчёты находятся в worktree своей группы.
+
+Flow и агенты фиксируются в группе при создании. Изменения YAML применяются к новым группам;
+старые конфиги версии 1 загружаются через слой миграции для обратной совместимости. Без выбранного
+flow группа остаётся в ручном режиме. При нескольких flows укажите `create --flow`.
+
+В TUI можно смотреть roadmap и продолжать работу через prompt callbacks: выбор этапа и передача
+задания остаются последовательными, а callbacks CLI доступны агентам и пользователю. Состояние
+roadmap вычисляется из `events.jsonl`; закрытие TUI не останавливает workflow.
 
 Число панелей равно числу агентов; сетка подстраивается, при нехватке высоты появляется прокрутка.
 Группа сохраняет снимок агентов, моделей, инструкций и flow. Изменения YAML применяются к новым
@@ -185,6 +361,13 @@ Flow, связи ревью и флаг создания PR пока тольк�
 ```bash
 uv run python -m unittest discover -s tests -v
 uv run python -m compileall -q src tests
+```
+
+Целевые тесты конфигурации и CLI workflow можно запускать отдельно:
+
+```bash
+uv run python -m unittest discover -s tests -p 'test_project_config.py' -v
+uv run python -m unittest discover -s tests -p 'test_workflow_cli.py' -v
 ```
 
 Интеграционный тест запускается на отдельном временном tmux-сервере:

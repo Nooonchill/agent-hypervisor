@@ -1,0 +1,65 @@
+version: 2
+agents-dir: agents
+
+task-form:
+  request:
+    label: Запрос задачи
+    required: true
+  goal:
+    label: Общая цель
+  sources:
+    label: Источники (через запятую)
+  constraints:
+    label: Ограничения
+
+agents:
+  - agent-id: developer
+    agent-name: Developer
+  - agent-id: architect
+    agent-name: Architect
+  - agent-id: spec-writer
+    agent-name: Spec Writer
+
+flows:
+  - id: feature
+    name: Реализация изменений
+    task-form:
+      request:
+        label: Что нужно реализовать?
+      goal:
+        label: Ожидаемый результат
+      constraints:
+        default: Сохранять совместимость существующего API.
+    steps:
+      - id: implementation
+        agent-id: developer
+        goal: Реализовать запрос, используя начальный контекст группы.
+        reviewer-id: architect
+        review-goal: Проверить соответствие запросу, корректность и совместимость.
+        review-scope: ["**/*"]
+        auto-commit: true
+        human-approval: true
+
+  - id: documentation
+    name: Обновление документации
+    task-form:
+      request:
+        label: Какие документы обновить?
+      goal:
+        visible: false
+        default: Обновить документацию по запросу пользователя.
+      sources:
+        label: Документы (через запятую)
+        default: [README.md]
+      constraints:
+        visible: false
+        default: Изменять только документацию.
+    steps:
+      - id: documentation
+        agent-id: spec-writer
+        goal: Обновить документы, опираясь на начальный контекст группы.
+        reviewer-id: architect
+        review-goal: Проверить точность документации и соответствие запросу.
+        review-scope: ["README.md", "docs/**"]
+        auto-commit: true
+        human-approval: true

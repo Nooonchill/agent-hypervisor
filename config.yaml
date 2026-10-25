@@ -1,32 +1,74 @@
-version: 1
+version: 2
 agents-dir: examples/agents
+data-dir: .hypervisor
+
+task-form:
+  request:
+    label: Initial request
+    required: true
+    default: ""
+  goal:
+    label: Overall goal
+    required: false
+    default: ""
+  sources:
+    label: Sources (comma separated)
+    required: false
+    default: []
+  constraints:
+    label: Additional constraints
+    required: false
+    default: ""
 
 agents:
   - agent-id: spec-writer
     agent-name: Spec Writer
     model: null
-    reviewer-id: architect
-    create-pr: false
 
   - agent-id: developer
     agent-name: Developer
     model: null
-    reviewer-id: architect
-    create-pr: false
 
   - agent-id: architect
     agent-name: Architect
     model: null
-    reviewer-id: null
-    create-pr: false
 
-flow:
-  - id: specification
-    agent-id: spec-writer
-    goal: Describe the task requirements and acceptance criteria.
-  - id: design
-    agent-id: architect
-    goal: Review the specification and describe the implementation approach.
-  - id: implementation
-    agent-id: developer
-    goal: Implement the agreed changes and verify the acceptance criteria.
+flows:
+  - id: intent-implementation
+    name: Intent and implementation
+    task-form:
+      request:
+        label: Feature request
+      goal:
+        label: Expected result
+    steps:
+      - id: intent
+        agent-id: spec-writer
+        goal: Create openspec/intent.md from the user's request, constraints, and available project context.
+        reviewer-id: architect
+        review-goal: Confirm the intent captures the request, scope, requirements, and acceptance criteria without adding unsupported requirements.
+        review-scope:
+          - openspec/intent.md
+        checks:
+          - id: intent-file-exists
+            command: [test, -f, openspec/intent.md]
+        auto-commit: false
+        create-pr: false
+        human-approval: false
+
+      - id: implementation
+        agent-id: developer
+        goal: Implement the approved intent and verify its acceptance criteria.
+        reviewer-id: architect
+        review-goal: Check the implementation against the intent, correctness, maintainability, and relevant test coverage.
+        review-scope:
+          - src/**
+          - tests/**
+          - openspec/intent.md
+        checks:
+          - id: unit-tests
+            command: [uv, run, python, -m, unittest, discover, -s, tests, -v]
+            timeout: 300
+        auto-commit: false
+        create-pr: false
+        human-approval: true

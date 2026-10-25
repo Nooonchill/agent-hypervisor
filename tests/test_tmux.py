@@ -39,27 +39,22 @@ class TmuxBackendTests(unittest.TestCase):
         with self.assertRaises(HypervisorError):
             normalize_key("launch-missiles")
 
-    def test_send_text_types_literal_text_then_enter(self) -> None:
-        runner = Mock()
-        runner.side_effect = [
-            completed([], stdout=""),  # has-session
-            completed(
-                [],
-                stdout=(
-                    "1\tterminal-1\t0\t\tbash\trunning\n"
-                    "1\tterminal-2\t0\t\tbash\trunning\n"
-                    "1\tterminal-3\t0\t\tbash\trunning\n"
-                ),
-            ),
-            completed([]),
-            completed([]),
-        ]
+    def test_send_text_pastes_literal_multiline_text_then_queues_with_ctrl_q(self) -> None:
+        def run(args, **kwargs):
+            rows = "1\tterminal-1\t0\t\tbash\trunning\n" if args[1] == "list-windows" else ""
+            return completed(args, stdout=rows)
+
+        runner = Mock(side_effect=run)
         backend = TmuxBackend(runner=runner)
-        backend.send_text("123", 1, "hello; $(safe)")
+        prompt = "hello; $(safe)\nsecond line"
+        backend.send_text("123", 1, prompt)
         calls = [call.args[0] for call in runner.call_args_list]
-        literal_send = next(call for call in calls if call[1:3] == ["send-keys", "-l"])
-        self.assertEqual(literal_send[-1], "hello; $(safe)")
-        self.assertTrue(any(call[1] == "send-keys" and call[-1] == "Enter" for call in calls))
+        load = next(call for call in runner.call_args_list if call.args[0][1] == "load-buffer")
+        self.assertEqual(load.kwargs["input"], prompt)
+        paste = next(call for call in calls if call[1] == "paste-buffer")
+        self.assertIn("-p", paste)
+        self.assertIn("-r", paste)
+        self.assertTrue(any(call[1] == "send-keys" and call[-1] == "C-q" for call in calls))
 
     def test_status_is_collected_with_one_tmux_process(self) -> None:
         runner = Mock(

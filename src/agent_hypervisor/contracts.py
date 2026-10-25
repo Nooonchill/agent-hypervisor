@@ -1,17 +1,35 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from .models import GroupStatus
 from .state import AgentSession
+
+if TYPE_CHECKING:
+    from .project_config import ProjectConfig
+    from .workflow import WorkflowService
 
 
 class HypervisorBackend(Protocol):
     """Control-plane contract shared by TUI, CLI adapters and future integrations."""
 
+    project_config: ProjectConfig
+
+    @property
+    def workflow(self) -> WorkflowService: ...
+
     def create_group(
-        self, group_id: str, cwd: str | Path | None = None, *, task_type: str = "feature"
+        self,
+        group_id: str,
+        cwd: str | Path | None = None,
+        *,
+        task_type: str = "feature",
+        flow_id: str | None = None,
+        request: str | None = None,
+        goal: str | None = None,
+        sources: tuple[str, ...] | None = None,
+        constraints: str | None = None,
     ) -> GroupStatus: ...
 
     def list_groups(self) -> list[GroupStatus]: ...

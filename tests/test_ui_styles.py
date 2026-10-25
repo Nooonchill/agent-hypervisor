@@ -11,6 +11,22 @@ from tests.test_tui import PopulatedBackend
 
 
 class UiStyleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_controls_stay_with_the_selected_terminal(self) -> None:
+        app = HypervisorApp(backend=PopulatedBackend())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            self.assertTrue(app.query_one("#terminal-wrap-1 #start-button-1", Button).display)
+            title = app.query_one("#terminal-title-1")
+            for control in app.query_one("#terminal-wrap-1").query(Button):
+                self.assertEqual(control.region.y, title.region.y)
+                self.assertEqual(control.region.height, 1)
+                self.assertGreaterEqual(control.region.x, title.region.right)
+            self.assertFalse(app.query_one("#terminal-wrap-2 #start-button-2", Button).display)
+            app.action_select_terminal(2)
+            await pilot.pause()
+            self.assertFalse(app.query_one("#terminal-wrap-1 #start-button-1", Button).display)
+            self.assertTrue(app.query_one("#terminal-wrap-2 #start-button-2", Button).display)
+
     async def test_delete_button_and_tooltip_fit_at_sidebar_edge(self) -> None:
         app = HypervisorApp(backend=PopulatedBackend())
         async with app.run_test(size=(120, 40), tooltips=True) as pilot:

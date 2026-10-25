@@ -25,6 +25,7 @@ class StateStoreTests(unittest.TestCase):
             backend = TmuxBackend(
                 runner=tmux_runner,
                 state_store=StateStore(Path(directory) / "groups.json"),
+                project_config=ProjectConfig.default(),
             )
 
             status = backend.create_group("sleeping", root)
@@ -54,7 +55,8 @@ class StateStoreTests(unittest.TestCase):
 
             renamed = store.rename("task-1", "task-2")
             self.assertEqual(renamed.group_id, "task-2")
-            self.assertIsNone(store.get("task-1"))
+            # In-flight agent callbacks keep working with the old task identifier.
+            self.assertEqual(store.get("task-1").group_id, "task-2")
             self.assertEqual(store.get("task-2").worktree_path, record.worktree_path)
 
     def test_qwen_commands_distinguish_new_and_resumed_sessions(self) -> None:

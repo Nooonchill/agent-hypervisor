@@ -5,14 +5,17 @@ import os
 import re
 import shlex
 import subprocess
+import time
 import uuid
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 
-from .models import GroupStatus, HypervisorError, TerminalState, TerminalStatus
+from .models import AgentManualMode, GroupStatus, HypervisorError, TerminalState, TerminalStatus
 from .project_config import AgentSpec, ProjectConfig, load_project_config
 from .state import AgentSession, GroupRecord, StateStore, terminal_session_name, utc_now
 from .worktrees import GitWorktreeManager
+from .task_form import resolve_task_context
 
 SESSION_PREFIX = "agent-hypervisor-"
 GROUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
@@ -45,6 +48,12 @@ class TmuxBackend:
         self._uuid_factory = uuid_factory
         self.project_config = project_config or load_project_config()
         self._terminal_counts: dict[str, int] = {}
+
+    @property
+    def workflow(self):
+        from .workflow import WorkflowService
+
+        return WorkflowService(self)
 
     @staticmethod
     def validate_group_id(group_id: str) -> str:
@@ -81,7 +90,16 @@ class TmuxBackend:
         return True
 
     def create_group(
-        self, group_id: str, cwd: str | Path | None = None, *, task_type: str = "feature"
+        self,
+        group_id: str,
+        cwd: str | Path | None = None,
+        *,
+        task_type: str = "feature",
+        flow_id: str | None = None,
+        request: str | None = None,
+        goal: str | None = None,
+        sources: tuple[str, ...] | None = None,
+        constraints: str | None = None,
     ) -> GroupStatus:
         session = self.session_name(group_id)
         if self.state.get(group_id) is not None or self._has_session(session):
@@ -89,6 +107,16 @@ class TmuxBackend:
         source = Path(cwd or Path.cwd()).resolve()
         if not source.is_dir():
             raise HypervisorError(f"Working directory does not exist: {source}")
+        flow = self.project_config.select_flow(flow_id)
+        context = resolve_task_context(
+            self.project_config.form_for_flow(flow_id),
+            {
+                "request": request,
+                "goal": goal,
+                "sources": sources,
+                "constraints": constraints,
+            },
+        )
         worktree = self.worktrees.create(group_id, source, task_type)
         sessions = {
             number: [AgentSession(str(self._uuid_factory()), number, agent_id=agent.agent_id)]
@@ -102,13 +130,18 @@ class TmuxBackend:
             sessions=sessions,
             active_sessions={number: items[0].session_id for number, items in sessions.items()},
             agents=self.project_config.agents,
-            flow=self.project_config.flow,
+            flow=flow.steps if flow else self.project_config.flow,
             task_code=group_id,
             task_type=task_type,
+            flow_id=flow.flow_id if flow else "",
+            data_dir=self.project_config.data_dir,
+            agent_command=self.agent_command,
         )
         try:
             self.state.save(record)
+            self.workflow.initialize(group_id, **context)
         except Exception:
+            self.state.delete(group_id)
             try:
                 self.worktrees.remove(record.repository_root, record.worktree_path)
             except HypervisorError:
@@ -219,7 +252,9 @@ class TmuxBackend:
             session.started for sessions in record.sessions.values() for session in sessions
         )
         recorded_sessions = (
-            set(self._qwen_session_catalog(record.worktree_path)) if has_started_sessions else set()
+            set(self._qwen_session_catalog(record.worktree_path, record.agent_command))
+            if has_started_sessions
+            else set()
         )
         for terminal in range(1, len(record.terminal_agents) + 1):
             record = self.state.get(group_id) or record
@@ -241,6 +276,14 @@ class TmuxBackend:
         return self.status(group_id)
 
     def rename_group(self, group_id: str, new_group_id: str) -> GroupStatus:
+        record = self.state.get(group_id)
+        if record is None:
+            raise HypervisorError(f"Group {group_id!r} does not exist")
+        guard = self.workflow._store(group_id).transaction() if record.flow_id else nullcontext()
+        with guard:
+            return self._rename_group(record.group_id, new_group_id)
+
+    def _rename_group(self, group_id: str, new_group_id: str) -> GroupStatus:
         old_session = self.session_name(group_id)
         new_session = self.session_name(new_group_id)
         if self.state.get(new_group_id) is not None or self._has_session(new_session):
@@ -260,6 +303,16 @@ class TmuxBackend:
         return self.status(new_group_id)
 
     def remove_group(self, group_id: str, remove_worktree: bool = False) -> None:
+        record = self.state.get(group_id)
+        guard = (
+            self.workflow._store(group_id).transaction()
+            if record and record.flow_id
+            else nullcontext()
+        )
+        with guard:
+            self._remove_group(record.group_id if record else group_id, remove_worktree)
+
+    def _remove_group(self, group_id: str, remove_worktree: bool) -> None:
         session = self.session_name(group_id)
         record = self.state.get(group_id)
         if record is None and not self._has_session(session):
@@ -314,13 +367,19 @@ class TmuxBackend:
             managed_session.last_started_at = utc_now()
             if recorded_sessions is None:
                 resume = managed_session.started and self._qwen_session_exists(
-                    record.worktree_path, session_id
+                    record.worktree_path, session_id, record.agent_command
                 )
             else:
                 resume = managed_session.started and session_id in recorded_sessions
             managed_session.started = True
         record.active_sessions[terminal] = session_id
-        command = self._qwen_command(session_id, terminal=terminal, resume=resume, agent=agent)
+        command = self._qwen_command(
+            session_id,
+            terminal=terminal,
+            resume=resume,
+            agent=agent,
+            agent_command=record.agent_command,
+        )
         target = self._target(session, terminal)
         status = self.status(group_id).terminals[terminal - 1]
         if status.state is TerminalState.MISSING:
@@ -366,10 +425,124 @@ class TmuxBackend:
         self.start_terminal(group_id, terminal, session_id)
 
     def send_text(self, group_id: str, terminal: int, text: str, enter: bool = True) -> None:
-        session = self._require_running_terminal(group_id, terminal)
-        self.send_literal(group_id, terminal, text)
         if enter:
-            self._tmux("send-keys", "-t", self._target(session, terminal), "Enter")
+            self.queue_prompt(group_id, terminal, text)
+        else:
+            self._require_running_terminal(group_id, terminal)
+            self.send_literal(group_id, terminal, text)
+
+    def workflow_session(self, group_id: str, agent_id: str, session_id: str) -> int:
+        """Switch the visible terminal without killing a submitting agent's CLI child.
+
+        Earlier conversations remain in tmux history windows until group removal.
+        Every review receives a new UUID, including reviews by the executor's role.
+        """
+        record = self.state.get(group_id)
+        if record is None:
+            raise HypervisorError(f"Unknown group: {group_id}")
+        number = next(
+            (
+                index
+                for index, agent in enumerate(record.terminal_agents, 1)
+                if agent.agent_id == agent_id
+            ),
+            None,
+        )
+        if number is None:
+            raise HypervisorError(f"Unknown agent in group: {agent_id}")
+        session = self._ensure_tmux_session(record)
+        current = record.active_sessions.get(number)
+        state = self.status(group_id).terminals[number - 1].state
+        if current == session_id and state is TerminalState.RUNNING:
+            return number
+        windows = self._tmux("list-windows", "-t", session, "-F", "#{window_name}").splitlines()
+        target = self._target(session, number)
+        visible = f"terminal-{number}"
+        if visible in windows:
+            archive = f"history-{current or uuid.uuid4().hex}"
+            if archive in windows:
+                archive += f"-{uuid.uuid4().hex[:8]}"
+            self._tmux("rename-window", "-t", target, archive)
+        known = next(
+            (item for item in record.sessions.get(number, []) if item.session_id == session_id),
+            None,
+        )
+        archived = f"history-{session_id}"
+        if archived in windows:
+            self._tmux("rename-window", "-t", f"{session}:{archived}", visible)
+            record.active_sessions[number] = session_id
+            self.state.save(record)
+            # An archived conversation may have exited while another role ran.
+            if self.status(group_id).terminals[number - 1].state is not TerminalState.RUNNING:
+                self._start_terminal(record, number, session_id)
+        else:
+            if known is None:
+                record.sessions.setdefault(number, []).append(
+                    AgentSession(session_id, number, agent_id=agent_id)
+                )
+                self.state.save(record)
+            self._start_terminal(record, number, session_id)
+        return number
+
+    def queue_prompt(
+        self,
+        group_id: str,
+        terminal: int,
+        text: str,
+        *,
+        wait_ready: bool = False,
+    ) -> None:
+        """Bracketed paste avoids newlines being interpreted as premature submits."""
+        session = self._require_running_terminal(group_id, terminal)
+        record = self.state.get(group_id)
+        workflow = self.workflow if record and record.flow_id else None
+        agent_id = record.terminal_agents[terminal - 1].agent_id if record else ""
+
+        def check_mode() -> None:
+            if workflow and workflow.agent_mode(group_id, agent_id) == "manual":
+                raise AgentManualMode("Agent is in manual mode; automatic prompts are paused")
+
+        check_mode()
+        if wait_ready:
+            deadline = time.monotonic() + 45
+            while True:
+                check_mode()
+                screen = self.capture(group_id, terminal, lines=0)
+                plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", screen)
+                if re.search(r"(?m)^\s*[>›❯](?:\s|$)", plain):
+                    break
+                if time.monotonic() >= deadline:
+                    raise HypervisorError(
+                        "Qwen prompt is not ready; inspect the terminal and retry delivery"
+                    )
+                time.sleep(0.15)
+        name = f"hypervisor-{uuid.uuid4().hex}"
+        guard = workflow._store(group_id).agent_gate(agent_id) if workflow else nullcontext()
+        with guard:
+            check_mode()
+            try:
+                loaded = self._runner(
+                    ["tmux", "load-buffer", "-b", name, "-"],
+                    input=text,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if loaded.returncode:
+                    raise HypervisorError(loaded.stderr.strip() or "Cannot load prompt buffer")
+                self._tmux(
+                    "paste-buffer",
+                    "-p",
+                    "-r",
+                    "-d",
+                    "-b",
+                    name,
+                    "-t",
+                    self._target(session, terminal),
+                )
+                self.send_key(group_id, terminal, "ctrl+q")
+            finally:
+                self._tmux("delete-buffer", "-b", name, check=False)
 
     def send_literal(self, group_id: str, terminal: int, text: str) -> None:
         """Type literal text with one tmux call, optimized for interactive TUI input."""
@@ -408,11 +581,22 @@ class TmuxBackend:
         return self._tmux("capture-pane", "-p", "-e", "-J", *history, "-t", target).rstrip()
 
     def _qwen_command(
-        self, session_id: str, *, terminal: int, resume: bool, agent: AgentSpec | None = None
+        self,
+        session_id: str,
+        *,
+        terminal: int,
+        resume: bool,
+        agent: AgentSpec | None = None,
+        agent_command: Sequence[str] = (),
     ) -> str:
         agent = agent or self.project_config.agents[terminal - 1]
         session_flag = "--resume" if resume else "--session-id"
-        arguments = [*self.agent_command, "--chat-recording", session_flag, session_id]
+        arguments = [
+            *(agent_command or self.agent_command),
+            "--chat-recording",
+            session_flag,
+            session_id,
+        ]
         if agent.model is not None:
             arguments.extend(["--model", agent.model])
         if agent.instructions:
@@ -422,19 +606,31 @@ class TmuxBackend:
             arguments.extend(["--prompt-interactive", f"/rename {name}"])
         return shlex.join(arguments)
 
-    def _qwen_session_exists(self, cwd: str, session_id: str) -> bool:
-        return session_id in self._qwen_session_catalog(cwd)
+    def _qwen_session_exists(
+        self, cwd: str, session_id: str, agent_command: Sequence[str] = ()
+    ) -> bool:
+        return session_id in self._qwen_session_catalog(cwd, agent_command)
 
-    def _qwen_session_catalog(self, cwd: str) -> dict[str, dict[str, object]]:
+    def _qwen_session_catalog(
+        self, cwd: str, agent_command: Sequence[str] = ()
+    ) -> dict[str, dict[str, object]]:
         try:
             result = self._agent_runner(
-                [*self.agent_command, "sessions", "list", "--json", "--limit", "1000"],
+                [
+                    *(agent_command or self.agent_command),
+                    "sessions",
+                    "list",
+                    "--json",
+                    "--limit",
+                    "1000",
+                ],
                 cwd=cwd,
                 check=False,
                 capture_output=True,
                 text=True,
+                timeout=30,
             )
-        except FileNotFoundError:
+        except (OSError, subprocess.TimeoutExpired):
             return {}
         if result.returncode != 0:
             return {}

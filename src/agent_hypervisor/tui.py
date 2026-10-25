@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import ClassVar
@@ -29,6 +30,7 @@ from .clipboard import copy_native
 from .config import (
     ACTIONS,
     ACTIVE_GROUP_ICON,
+    AGENT_MODE_ICONS,
     BACKGROUND_REFRESH_DIVISOR,
     CAPTURE_HISTORY_LINES,
     GROUP_MARKERS,
@@ -41,6 +43,7 @@ from .config import (
     TERMINAL_STATE_LABELS,
     TERMINAL_STATE_MARKERS,
     TEXT,
+    WORKFLOW_STATE_LABELS,
 )
 from .contracts import HypervisorBackend
 from .diagnostics import LOGGER_NAME
@@ -48,6 +51,10 @@ from .dialogs import (
     BranchTypeScreen,
     ConfirmRemoveScreen,
     CreateGroupScreen,
+    FlowPickerScreen,
+    GroupContextScreen,
+    HumanDecisionScreen,
+    ReportScreen,
     RenameGroupScreen,
     SessionPickerScreen,
     WorktreeDispositionScreen,
@@ -55,7 +62,8 @@ from .dialogs import (
 from .models import GroupStatus, HypervisorError, TerminalState
 from .project_config import ProjectConfig
 from .tmux import TmuxBackend
-from .widgets import HypervisorButton
+from .widgets import HypervisorButton, WorkflowRoadmap
+from .task_form import DEFAULT_TASK_FORM
 
 LOGGER = logging.getLogger(f"{LOGGER_NAME}.tui")
 
@@ -171,6 +179,21 @@ class TerminalPanel(RichLog):
 # Dialog screens are implemented in dialogs.py and re-exported here for compatibility.
 
 
+class TerminalHeading(Label):
+    def __init__(self, number: int) -> None:
+        super().__init__(
+            TERMINAL_LABEL.format(number=number),
+            id=f"terminal-title-{number}",
+            classes="terminal-title",
+            markup=False,
+        )
+        self.number = number
+
+    def on_click(self) -> None:
+        if not self.screen.get_selected_text():
+            self.post_message(TerminalPanel.Selected(self.number))
+
+
 class HypervisorApp(App[None]):
     TITLE = TEXT["app_title"]
     SUB_TITLE = TEXT["app_subtitle"]
@@ -204,6 +227,12 @@ class HypervisorApp(App[None]):
         self._flush_timers: dict[tuple[str, int], object] = {}
         self._input_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tmux-input")
         self._clipboard_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="clipboard")
+        self._workflow_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="workflow-ui"
+        )
+        self._mode_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="agent-mode")
+        self._workflow_status: dict | None = None
+        self._workflow_busy_groups: set[str] = set()
         self._main_screen: Screen | None = None
         self._unmounting = False
 
@@ -230,26 +259,17 @@ class HypervisorApp(App[None]):
                         button.tooltip = spec.tooltip_for()
                         yield button
             with Vertical(id="main"):
-                with Horizontal(id="group-header"):
-                    yield Label(TEXT["no_group"], id="group-title")
-                    yield Label("", id="group-state")
+                with Vertical(id="group-header"):
+                    with Horizontal(id="group-title-row"):
+                        yield Label(TEXT["no_group"], id="group-title")
+                        yield HypervisorButton(TEXT["workflow_start"], id="workflow-start")
+                        yield Label("", id="group-state")
+                    with Horizontal(id="workflow-row"):
+                        yield WorkflowRoadmap(id="workflow-roadmap")
                 yield Static(TEXT["empty"], id="empty")
                 with Container(id="terminal-grid"):
                     for number in range(1, self._panel_count + 1):
-                        yield TerminalPanel(number)
-                with Horizontal(id="command-row"):
-                    start_spec = ACTIONS["restart_terminal"]
-                    start = HypervisorButton(
-                        start_spec.icon, id=start_spec.button_id, classes="icon-button"
-                    )
-                    start.tooltip = start_spec.tooltip_for()
-                    yield start
-                    stop_spec = ACTIONS["stop_terminal"]
-                    stop = HypervisorButton(
-                        stop_spec.icon, id=stop_spec.button_id, classes="icon-button"
-                    )
-                    stop.tooltip = stop_spec.tooltip_for()
-                    yield stop
+                        yield self._terminal_wrapper(number)
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -272,6 +292,29 @@ class HypervisorApp(App[None]):
         self._flush_all_input()
         self._input_executor.shutdown(wait=False, cancel_futures=False)
         self._clipboard_executor.shutdown(wait=False, cancel_futures=True)
+        self._workflow_executor.shutdown(wait=False, cancel_futures=True)
+        self._mode_executor.shutdown(wait=False, cancel_futures=False)
+
+    @staticmethod
+    def _terminal_wrapper(number: int) -> Vertical:
+        start_spec = ACTIONS["restart_terminal"]
+        stop_spec = ACTIONS["stop_terminal"]
+        start = HypervisorButton(
+            start_spec.icon, id=f"start-button-{number}", classes="icon-button"
+        )
+        start.tooltip = start_spec.tooltip_for()
+        stop = HypervisorButton(stop_spec.icon, id=f"stop-button-{number}", classes="icon-button")
+        stop.tooltip = stop_spec.tooltip_for()
+        mode_spec = ACTIONS["toggle_agent_mode"]
+        mode = HypervisorButton(mode_spec.icon, id=f"mode-button-{number}", classes="icon-button")
+        mode.disabled = True
+        mode.tooltip = mode_spec.tooltip_for()
+        return Vertical(
+            Horizontal(TerminalHeading(number), start, stop, mode, classes="terminal-controls"),
+            TerminalPanel(number),
+            id=f"terminal-wrap-{number}",
+            classes="terminal-wrapper",
+        )
 
     def _main_query_one(self, selector: str, expect_type=None):
         screen = self._main_screen or self.screen
@@ -371,14 +414,228 @@ class HypervisorApp(App[None]):
             self.selected_terminal_state.value,
         )
 
-    @on(Button.Pressed, "#start-button")
-    def start_button(self) -> None:
+    @on(Button.Pressed, ".terminal-controls .icon-button")
+    def terminal_control_button(self, event: Button.Pressed) -> None:
+        wrapper = event.button.parent.parent
+        self.selected_terminal = int(wrapper.id.rsplit("-", 1)[1])
+        self._update_selection()
+        if event.button.id.startswith("mode-button"):
+            self.action_toggle_agent_mode()
+            return
+        if event.button.id.startswith("stop-button"):
+            self._terminal_action("stop")
+            return
         action = "restart" if self.selected_terminal_state is TerminalState.RUNNING else "start"
         self._terminal_action(action)
 
-    @on(Button.Pressed, "#stop-button")
-    def stop_button(self) -> None:
-        self._terminal_action("stop")
+    @on(Button.Pressed, "#workflow-start")
+    def workflow_start_button(self) -> None:
+        self._run_workflow_action()
+
+    @on(WorkflowRoadmap.StageSelected)
+    def roadmap_stage_selected(self, event: WorkflowRoadmap.StageSelected) -> None:
+        stage = next(
+            (
+                stage
+                for stage in (self._workflow_status or {}).get("stages", [])
+                if str(stage.get("id")) == event.stage_id
+            ),
+            None,
+        )
+        if stage is not None:
+            self._open_workflow_stage(stage)
+
+    def _open_workflow_stage(self, stage: dict) -> None:
+        stage_id = str(stage.get("id", "stage"))
+        status = self._workflow_status or {}
+        allow_decision = stage.get("state") == "awaiting-human"
+        state = str(stage.get("state", "pending"))
+        sections = [
+            TEXT["workflow_detail_header"].format(
+                flow=status.get("flow_id", ""),
+                stage=stage_id,
+                state=WORKFLOW_STATE_LABELS.get(state, state),
+            )
+        ]
+        if stage.get("goal"):
+            sections.append(TEXT["workflow_detail_goal"].format(goal=stage["goal"]))
+        if stage.get("summary"):
+            sections.append(TEXT["workflow_detail_result"].format(summary=stage["summary"]))
+        if stage.get("checks"):
+            lines = [TEXT["workflow_detail_checks"]]
+            for check in stage["checks"]:
+                lines.append(
+                    TEXT["workflow_detail_check"].format(
+                        marker="✓" if check.get("returncode") == 0 else "×",
+                        name=check.get("id", "check"),
+                        code=check.get("returncode", "?"),
+                    )
+                )
+            sections.append("\n".join(lines))
+        review = stage.get("review") or {}
+        if review:
+            sections.append(
+                TEXT["workflow_detail_review"].format(
+                    decision=review.get("decision", ""), summary=review.get("summary", "")
+                )
+            )
+            sections.extend(f"• {finding}" for finding in review.get("findings", []))
+        if stage.get("commit"):
+            sections.append(TEXT["workflow_detail_commit"].format(commit=stage["commit"]))
+        if stage.get("pr"):
+            sections.append(TEXT["workflow_detail_pr"].format(status=stage["pr"]))
+        if stage.get("error"):
+            sections.append(str(stage["error"]))
+        details = "\n\n".join(sections)
+        reports = self._stage_report_paths(stage)
+        self.push_screen(
+            HumanDecisionScreen(stage_id, details, allow_decision=allow_decision, reports=reports),
+            lambda result: self._submit_human_decision(stage, result) if allow_decision else None,
+        )
+
+    @staticmethod
+    def _stage_report_paths(stage: dict) -> tuple[str, ...]:
+        paths: list[str] = []
+
+        def collect(value: object, key: str = "") -> None:
+            if isinstance(value, dict):
+                for child_key, child in value.items():
+                    collect(child, child_key)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect(child, key)
+            elif isinstance(value, str) and key in {"report", "reports"}:
+                if value and value not in paths:
+                    paths.append(value)
+
+        collect(stage)
+        return tuple(paths)
+
+    @on(HumanDecisionScreen.ReportRequested)
+    def workflow_report_requested(self, event: HumanDecisionScreen.ReportRequested) -> None:
+        group_id = self.selected_group
+        workflow = getattr(self.backend, "workflow", None)
+        method = getattr(workflow, "report", None)
+        if group_id is None or not callable(method):
+            return
+        future = self._workflow_executor.submit(method, group_id, event.path)
+        future.add_done_callback(
+            lambda result, path=event.path: self._workflow_report_finished(path, result)
+        )
+
+    def _workflow_report_finished(self, path: str, future: Future[object]) -> None:
+        try:
+            content = str(future.result())
+            error = None
+        except Exception as exc:
+            content, error = "", exc
+        self._dispatch_to_ui(self._open_workflow_report, path, content, error)
+
+    def _open_workflow_report(self, path: str, content: str, error: Exception | None) -> None:
+        if error is not None:
+            self.notify(TEXT["workflow_error"].format(error=error), severity="error")
+            return
+        self.push_screen(ReportScreen(path, content))
+
+    def _refresh_workflow(self, group_id: str) -> None:
+        workflow = getattr(self.backend, "workflow", None)
+        if workflow is None or not callable(getattr(workflow, "status", None)):
+            self._main_query_one("#workflow-row").styles.display = "none"
+            return
+        try:
+            status = workflow.status(group_id)
+        except Exception as error:
+            LOGGER.warning("workflow status unavailable for %s: %s", group_id, error)
+            return
+        self._apply_workflow_status(group_id, status, None)
+
+    def _apply_workflow_status(
+        self, group_id: str, status: object, error: Exception | None
+    ) -> None:
+        if self.selected_group != group_id or self._unmounting:
+            return
+        if error is not None or not isinstance(status, dict):
+            LOGGER.warning("workflow status unavailable for %s: %s", group_id, error)
+            return
+        changed = status != self._workflow_status
+        self._workflow_status = status
+        self._update_agent_modes()
+        state = str(status.get("state", "pending"))
+        has_stages = bool(status.get("stages"))
+        self._main_query_one("#workflow-row").styles.display = (
+            "none" if state == "manual" or not has_stages else "block"
+        )
+        button = self._main_query_one("#workflow-start", Button)
+        button.styles.display = "block" if has_stages else "none"
+        busy = group_id in self._workflow_busy_groups
+        button.disabled = busy or state in {"completed", "manual"}
+        button.label = TEXT["workflow_start"] if state == "pending" else TEXT["workflow_resume"]
+        button.tooltip = (
+            TEXT["workflow_running"]
+            if busy
+            else TEXT["workflow_resume_help"]
+            if state != "pending"
+            else state
+        )
+        if changed:
+            self.call_later(self._render_workflow_roadmap)
+
+    def _render_workflow_roadmap(self) -> None:
+        self._main_query_one("#workflow-roadmap", WorkflowRoadmap).update_stages(
+            (self._workflow_status or {}).get("stages", [])
+        )
+
+    def _run_workflow_action(self) -> None:
+        if self.selected_group is None or self.selected_group in self._workflow_busy_groups:
+            return
+        workflow = getattr(self.backend, "workflow", None)
+        if workflow is None:
+            return
+        state = str((self._workflow_status or {}).get("state", "pending"))
+        method = getattr(
+            workflow,
+            "start" if state == "pending" else "resume",
+            None,
+        )
+        if not callable(method):
+            return
+        group_id = self.selected_group
+        self._workflow_busy_groups.add(group_id)
+        self._main_query_one("#workflow-start", Button).disabled = True
+        future = self._workflow_executor.submit(method, group_id)
+        future.add_done_callback(lambda result: self._workflow_action_finished(group_id, result))
+
+    def _workflow_action_finished(self, group_id: str, future: Future[object]) -> None:
+        try:
+            future.result()
+            error = None
+        except Exception as exc:
+            error = exc
+        self._dispatch_to_ui(self._workflow_action_applied, group_id, error)
+
+    def _workflow_action_applied(self, group_id: str, error: Exception | None) -> None:
+        self._workflow_busy_groups.discard(group_id)
+        if error is not None:
+            self.notify(TEXT["workflow_error"].format(error=error), severity="error")
+        if self.selected_group == group_id:
+            self._refresh_workflow(group_id)
+
+    def _submit_human_decision(self, stage: dict, result: tuple[bool, str] | None) -> None:
+        if result is None or self.selected_group is None:
+            return
+        workflow = getattr(self.backend, "workflow", None)
+        method = getattr(workflow, "human_decision", None)
+        if not callable(method):
+            return
+        group_id = self.selected_group
+        step_id = str(stage.get("id", ""))
+        attempt = str(stage.get("attempt", ""))
+        self._workflow_busy_groups.add(group_id)
+        self._main_query_one("#workflow-start", Button).disabled = True
+        future = self._workflow_executor.submit(
+            method, group_id, step_id, attempt, approved=result[0], comment=result[1]
+        )
+        future.add_done_callback(lambda result: self._workflow_action_finished(group_id, result))
 
     async def refresh_all(self, rebuild_groups: bool = True) -> None:
         if (
@@ -431,8 +688,7 @@ class HypervisorApp(App[None]):
                 and self._output_tick % BACKGROUND_REFRESH_DIVISOR != 0
             ):
                 continue
-            panel = self._main_query_one(f"#terminal-{status.number}", TerminalPanel)
-            if panel.styles.display == "none":
+            if self._main_query_one(f"#terminal-wrap-{status.number}").styles.display == "none":
                 continue
             try:
                 snapshot = self.backend.capture(
@@ -466,7 +722,7 @@ class HypervisorApp(App[None]):
         self._main_screen.clear_selection()
         grid = self._main_query_one("#terminal-grid", Container)
         await grid.remove_children()
-        await grid.mount(*(TerminalPanel(number) for number in range(1, count + 1)))
+        await grid.mount(*(self._terminal_wrapper(number) for number in range(1, count + 1)))
         self._panel_count = count
         self.selected_terminal = min(self.selected_terminal, count)
 
@@ -477,9 +733,12 @@ class HypervisorApp(App[None]):
         # Textual's ``display`` property controls visibility only; the grid layout
         # itself is declared in CSS with ``layout: grid``.
         self._main_query_one("#terminal-grid").styles.display = "block" if has_group else "none"
-        self._main_query_one("#command-row").styles.display = "block" if has_group else "none"
+        self._main_query_one("#workflow-row").styles.display = "block" if has_group else "none"
         if group is None:
             self.selected_terminal_state = TerminalState.MISSING
+            self._workflow_status = None
+            self._main_query_one("#workflow-row").styles.display = "none"
+            self._main_query_one("#workflow-start").styles.display = "none"
             self._main_query_one("#group-title", Label).update(TEXT["no_group"])
             self._main_query_one("#group-state", Label).update("")
             self._main_query_one("#activate-group", Button).disabled = True
@@ -515,8 +774,11 @@ class HypervisorApp(App[None]):
                 snapshots[status.number] = error
         for status in group.terminals:
             panel = self._main_query_one(f"#terminal-{status.number}", TerminalPanel)
+            wrapper = self._main_query_one(f"#terminal-wrap-{status.number}")
             panel.set_class(status.number == self.selected_terminal, "selected")
             panel.set_class(status.state is TerminalState.STOPPED, "stopped")
+            wrapper.set_class(status.number == self.selected_terminal, "selected")
+            wrapper.set_class(status.state is TerminalState.STOPPED, "stopped")
             if status.state is not TerminalState.RUNNING:
                 self._snapshots.pop((group.group_id, status.number), None)
             panel.remove_class("scrollback")
@@ -559,13 +821,24 @@ class HypervisorApp(App[None]):
                 else:
                     self._update_snapshot(group.group_id, status.number, snapshot, force=True)
 
+            self._main_query_one(f"#terminal-title-{status.number}", Label).update(
+                Text(str(panel.border_title))
+            )
+
         selected_status = group.terminals[self.selected_terminal - 1]
         self.selected_terminal_state = selected_status.state
+        for status in group.terminals:
+            wrapper = self._main_query_one(f"#terminal-wrap-{status.number}")
+            controls = list(wrapper.query(".terminal-controls Button"))
+            wrapper.query_one(".terminal-controls").styles.display = "block"
+            for control in controls:
+                control.styles.display = (
+                    "block" if status.number == self.selected_terminal else "none"
+                )
+            controls[0].disabled = not group.active
+            controls[1].disabled = not group.active or status.state is not TerminalState.RUNNING
         self._update_terminal_controls(selected_status.state)
-        self._main_query_one("#start-button", Button).disabled = not group.active
-        self._main_query_one("#stop-button", Button).disabled = (
-            not group.active or selected_status.state is not TerminalState.RUNNING
-        )
+        self._refresh_workflow(group.group_id)
         self._apply_fullscreen()
         self.call_after_refresh(self._sync_terminal_sizes)
 
@@ -586,12 +859,68 @@ class HypervisorApp(App[None]):
         )
 
     def _update_terminal_controls(self, state: TerminalState) -> None:
-        start_button = self._main_query_one("#start-button", Button)
+        start_button = self._main_query_one(f"#start-button-{self.selected_terminal}", Button)
         start_button.label = TERMINAL_ACTION_ICONS[state.value]
         start_button.tooltip = ACTIONS["restart_terminal"].tooltip_for(
             TEXT["restart_tooltip"] if state is TerminalState.RUNNING else TEXT["start_tooltip"]
         )
-        self._main_query_one("#stop-button", Button).disabled = state is not TerminalState.RUNNING
+        self._main_query_one(f"#stop-button-{self.selected_terminal}", Button).disabled = (
+            state is not TerminalState.RUNNING
+        )
+
+    def _update_agent_modes(self) -> None:
+        if self._current_group is None:
+            return
+        status = self._workflow_status or {}
+        modes = status.get("agent_modes", {})
+        available = bool(status.get("flow_id")) and callable(
+            getattr(getattr(self.backend, "workflow", None), "set_agent_mode", None)
+        )
+        for terminal in self._current_group.terminals:
+            mode = modes.get(terminal.agent_id, "workflow")
+            button = self._main_query_one(f"#mode-button-{terminal.number}", Button)
+            button.disabled = not available
+            button.label = AGENT_MODE_ICONS[mode]
+            button.set_class(mode == "manual", "manual-mode")
+            button.tooltip = (
+                TEXT["agent_no_workflow"]
+                if not available
+                else TEXT["agent_manual_tooltip" if mode == "manual" else "agent_workflow_tooltip"]
+            )
+            self._main_query_one(f"#terminal-wrap-{terminal.number}").border_subtitle = (
+                TEXT["agent_manual_badge"] if mode == "manual" else ""
+            )
+
+    def action_toggle_agent_mode(self) -> None:
+        if self.selected_group is None or self._current_group is None:
+            return
+        workflow = getattr(self.backend, "workflow", None)
+        setter = getattr(workflow, "set_agent_mode", None)
+        if not callable(setter) or not (self._workflow_status or {}).get("flow_id"):
+            return
+        terminal = self._current_group.terminals[self.selected_terminal - 1]
+        current = (
+            (self._workflow_status or {}).get("agent_modes", {}).get(terminal.agent_id, "workflow")
+        )
+        group_id = self.selected_group
+        future = self._mode_executor.submit(
+            setter, group_id, terminal.agent_id, "workflow" if current == "manual" else "manual"
+        )
+        future.add_done_callback(lambda result: self._mode_finished(group_id, result))
+
+    def _mode_finished(self, group_id: str, future: Future[object]) -> None:
+        try:
+            future.result()
+            error = None
+        except Exception as exc:
+            error = exc
+        self._dispatch_to_ui(self._mode_applied, group_id, error)
+
+    def _mode_applied(self, group_id: str, error: Exception | None) -> None:
+        if error is not None:
+            self.notify(str(error), severity="error", timeout=4)
+        if self.selected_group == group_id:
+            self._refresh_workflow(group_id)
 
     def _clear_group_caches(self, group_id: str) -> None:
         self._terminal_sizes = {
@@ -608,6 +937,38 @@ class HypervisorApp(App[None]):
 
             def choose_type(task_type: str | None) -> None:
                 if task_type is None:
+                    return
+                flows = getattr(getattr(self.backend, "project_config", None), "flows", ())
+                if flows:
+
+                    def choose_flow(flow_id: str | None) -> None:
+                        if flow_id is None:
+                            return
+
+                        def collect_context(context: dict[str, object] | None) -> None:
+                            if context is None:
+                                return
+                            try:
+                                self.backend.create_group(
+                                    group_id,
+                                    task_type=task_type,
+                                    flow_id=flow_id,
+                                    **context,
+                                )
+                                self._clear_group_caches(group_id)
+                                self.selected_group = group_id
+                                self.call_later(self.refresh_all)
+                            except HypervisorError as error:
+                                self.notify(str(error), severity="error", timeout=4)
+
+                        fields = getattr(
+                            self.backend.project_config, "task_form", DEFAULT_TASK_FORM
+                        )
+                        selected_flow = next(flow for flow in flows if flow.flow_id == flow_id)
+                        fields = getattr(selected_flow, "task_form", None) or fields
+                        self.push_screen(GroupContextScreen(fields), collect_context)
+
+                    self.push_screen(FlowPickerScreen(tuple(flows)), choose_flow)
                     return
                 try:
                     self.backend.create_group(group_id, task_type=task_type)
@@ -700,6 +1061,15 @@ class HypervisorApp(App[None]):
             self._main_query_one(f"#terminal-{number}").set_class(
                 number == self.selected_terminal, "selected"
             )
+            self._main_query_one(f"#terminal-wrap-{number}").set_class(
+                number == self.selected_terminal, "selected"
+            )
+            controls_row = self._main_query_one(f"#terminal-wrap-{number}").query_one(
+                ".terminal-controls"
+            )
+            controls_row.styles.display = "block"
+            for control in controls_row.query(Button):
+                control.styles.display = "block" if number == self.selected_terminal else "none"
         self._apply_fullscreen()
         if self._current_group is not None:
             state = self._current_group.terminals[self.selected_terminal - 1].state
@@ -733,11 +1103,17 @@ class HypervisorApp(App[None]):
         )
         grid.styles.grid_rows = " ".join([row_size] * rows)
         for number in range(1, count + 1):
+            wrapper = self._main_query_one(f"#terminal-wrap-{number}")
             panel = self._main_query_one(f"#terminal-{number}")
-            panel.styles.column_span = (
+            wrapper.styles.column_span = (
                 columns
                 if not self.fullscreen_terminal and number == count and count % columns == 1
                 else 1
+            )
+            wrapper.styles.display = (
+                "block"
+                if not self.fullscreen_terminal or number == self.selected_terminal
+                else "none"
             )
             panel.styles.display = (
                 "block"
@@ -761,7 +1137,7 @@ class HypervisorApp(App[None]):
             requests: list[tuple[int, int, int]] = []
             for number in range(1, self._panel_count + 1):
                 panel = self._main_query_one(f"#terminal-{number}", TerminalPanel)
-                if panel.styles.display == "none":
+                if self._main_query_one(f"#terminal-wrap-{number}").styles.display == "none":
                     continue
                 width = max(20, panel.content_size.width)
                 height = max(5, panel.content_size.height)
@@ -799,10 +1175,16 @@ class HypervisorApp(App[None]):
         try:
             future.result()
         except HypervisorError as error:
-            try:
-                self.call_from_thread(self.notify, str(error), severity="error", timeout=4)
-            except RuntimeError:
-                pass
+            self._dispatch_to_ui(self.notify, str(error), severity="error", timeout=4)
+
+    def _dispatch_to_ui(self, callback, *args, **kwargs) -> None:
+        try:
+            if threading.get_ident() == self._thread_id:
+                self.call_later(callback, *args, **kwargs)
+            else:
+                self.call_from_thread(callback, *args, **kwargs)
+        except RuntimeError:
+            pass
 
     def action_restart_terminal(self) -> None:
         action = "restart" if self.selected_terminal_state is TerminalState.RUNNING else "start"

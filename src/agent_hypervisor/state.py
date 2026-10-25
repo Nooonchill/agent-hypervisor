@@ -12,7 +12,7 @@ from typing import Any
 
 from .config import AGENT_SESSION_LABEL, SESSION_LABEL
 from .models import HypervisorError
-from .project_config import AgentSpec, FlowStep, ProjectConfig
+from .project_config import AgentSpec, CheckSpec, FlowStep, ProjectConfig
 
 
 def default_state_path() -> Path:
@@ -71,6 +71,10 @@ class GroupRecord:
     flow: tuple[FlowStep, ...] = ()
     task_code: str = ""
     task_type: str = "feature"
+    flow_id: str = ""
+    data_dir: str = ".hypervisor"
+    agent_command: tuple[str, ...] = ()
+    aliases: tuple[str, ...] = ()
 
     @property
     def terminal_agents(self) -> tuple[AgentSpec, ...]:
@@ -96,10 +100,23 @@ class GroupRecord:
                 int(number): str(session_id)
                 for number, session_id in value.get("active_sessions", {}).items()
             },
-            agents=tuple(AgentSpec(**item) for item in value.get("agents", [])),
-            flow=tuple(FlowStep(**item) for item in value.get("flow", [])),
+            agents=tuple(
+                AgentSpec(
+                    **{
+                        key: val
+                        for key, val in item.items()
+                        if key not in {"reviewer_id", "create_pr"}
+                    }
+                )
+                for item in value.get("agents", [])
+            ),
+            flow=tuple(flow_step_from_dict(item) for item in value.get("flow", [])),
             task_code=str(value.get("task_code", value["group_id"])),
             task_type=str(value.get("task_type", "feature")),
+            flow_id=str(value.get("flow_id", "")),
+            data_dir=str(value.get("data_dir", ".hypervisor")),
+            agent_command=tuple(value.get("agent_command", ())),
+            aliases=tuple(value.get("aliases", ())),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -109,6 +126,19 @@ class GroupRecord:
             str(number): session_id for number, session_id in value["active_sessions"].items()
         }
         return value
+
+
+def flow_step_from_dict(item: dict[str, Any]) -> FlowStep:
+    return FlowStep(
+        **{
+            **item,
+            "review_scope": tuple(item.get("review_scope", ())),
+            "checks": tuple(
+                CheckSpec(check["check_id"], tuple(check["command"]), check["timeout"])
+                for check in item.get("checks", ())
+            ),
+        }
+    )
 
 
 class StateStore:
@@ -121,7 +151,10 @@ class StateStore:
         return sorted(self._read().values(), key=lambda group: group.group_id.lower())
 
     def get(self, group_id: str) -> GroupRecord | None:
-        return self._read().get(group_id)
+        groups = self._read()
+        return groups.get(group_id) or next(
+            (record for record in groups.values() if group_id in record.aliases), None
+        )
 
     def save(self, group: GroupRecord) -> None:
         with self._lock():
@@ -141,8 +174,9 @@ class StateStore:
             group = groups.pop(old_id, None)
             if group is None:
                 raise HypervisorError(f"Group {old_id!r} does not exist")
-            if new_id in groups:
+            if new_id in groups or any(new_id in item.aliases for item in groups.values()):
                 raise HypervisorError(f"Group {new_id!r} already exists")
+            group.aliases = (*group.aliases, old_id)
             group.group_id = new_id
             groups[new_id] = group
             self._write(groups)
