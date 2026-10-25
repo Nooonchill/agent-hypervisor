@@ -25,8 +25,6 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 class TmuxBackend:
-    """Shared tmux control plane used by both CLI and TUI."""
-
     def __init__(
         self,
         agent_command: Sequence[str] | None = None,
@@ -98,7 +96,7 @@ class TmuxBackend:
         flow_id: str | None = None,
         request: str | None = None,
         goal: str | None = None,
-        sources: tuple[str, ...] | None = None,
+        sources: str | tuple[str, ...] | None = None,
         constraints: str | None = None,
     ) -> GroupStatus:
         session = self.session_name(group_id)
@@ -379,6 +377,7 @@ class TmuxBackend:
             resume=resume,
             agent=agent,
             agent_command=record.agent_command,
+            record=record,
         )
         target = self._target(session, terminal)
         status = self.status(group_id).terminals[terminal - 1]
@@ -545,7 +544,6 @@ class TmuxBackend:
                 self._tmux("delete-buffer", "-b", name, check=False)
 
     def send_literal(self, group_id: str, terminal: int, text: str) -> None:
-        """Type literal text with one tmux call, optimized for interactive TUI input."""
         session = self.session_name(group_id)
         self._validate_terminal(terminal, group_id)
         self._tmux("send-keys", "-l", "-t", self._target(session, terminal), text)
@@ -588,6 +586,7 @@ class TmuxBackend:
         resume: bool,
         agent: AgentSpec | None = None,
         agent_command: Sequence[str] = (),
+        record: GroupRecord | None = None,
     ) -> str:
         agent = agent or self.project_config.agents[terminal - 1]
         session_flag = "--resume" if resume else "--session-id"
@@ -604,6 +603,12 @@ class TmuxBackend:
         if not resume:
             name = terminal_session_name(terminal, session_id, agent.agent_id)
             arguments.extend(["--prompt-interactive", f"/rename {name}"])
+        if record and record.flow_id:
+            from .mcp_config import session_environment
+
+            arguments = (
+                session_environment(record, agent.agent_id, session_id, self.state.path) + arguments
+            )
         return shlex.join(arguments)
 
     def _qwen_session_exists(
@@ -749,6 +754,21 @@ class TmuxBackend:
 
 def normalize_key(key: str) -> str:
     aliases = {
+        "backslash": "\\",
+        "left_square_bracket": "[",
+        "right_square_bracket": "]",
+        "circumflex_accent": "^",
+        "underscore": "_",
+        "at": "@",
+        "plus": "+",
+        "exclamation_mark": "!",
+        "number_sign": "#",
+        "dollar_sign": "$",
+        "percent_sign": "%",
+        "ampersand": "&",
+        "asterisk": "*",
+        "left_parenthesis": "(",
+        "right_parenthesis": ")",
         "enter": "Enter",
         "return": "Enter",
         "escape": "Escape",

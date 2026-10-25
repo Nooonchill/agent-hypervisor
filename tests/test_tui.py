@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from textual import events
-from textual.widgets import Button
+from textual.widgets import Button, Input, TextArea
 
 from agent_hypervisor.dialogs import (
     BranchTypeScreen,
@@ -155,6 +155,39 @@ class TuiSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(backend.last_create_args[3]["constraints"], "Docs context")
             self.assertEqual(backend.last_create_args[3]["sources"], ("docs.md",))
 
+    async def test_form_uses_configured_types_and_keeps_free_text_sources(self) -> None:
+        fields = tuple(
+            replace(field, input_type="text", placeholder="Task name")
+            if field.field_id == "request"
+            else replace(
+                field,
+                input_type="multiline",
+                default="",
+                description="Links or background context",
+                placeholder="Paste any text",
+            )
+            if field.field_id == "sources"
+            else field
+            for field in DEFAULT_TASK_FORM
+        )
+        app = HypervisorApp(backend=EmptyBackend())
+        results = []
+        async with app.run_test(size=(110, 50)) as pilot:
+            dialog = GroupContextScreen(fields)
+            app.push_screen(dialog, results.append)
+            await pilot.pause()
+            request = dialog.query_one("#context-request", Input)
+            source = dialog.query_one("#context-sources", TextArea)
+            self.assertEqual(request.placeholder, "Task name")
+            self.assertEqual(source.placeholder, "Paste any text")
+            self.assertTrue(list(dialog.query(".context-description")))
+            request.value = "Task"
+            value = "Read the design, especially section 2.\nAsk about examples."
+            source.load_text(value)
+            await pilot.click("#confirm")
+            await pilot.pause()
+            self.assertEqual(results[0]["sources"], value)
+
     async def test_configured_task_form_prefills_values_and_requires_missing_field(self) -> None:
         fields = tuple(
             replace(
@@ -176,7 +209,7 @@ class TuiSmokeTests(unittest.IsolatedAsyncioTestCase):
             app.push_screen(dialog, results.append)
             await pilot.pause()
             self.assertEqual(dialog.query_one("#context-request").text, "Preset request")
-            self.assertEqual(dialog.query_one("#context-sources").value, "spec.md")
+            self.assertEqual(dialog.query_one("#context-sources").text, "spec.md")
             await pilot.click("#confirm")
             await pilot.pause(0.3)
             self.assertIs(app.screen, dialog)
@@ -270,11 +303,10 @@ class TuiSmokeTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(app.selected_terminal, count)
                     self.assertIn(f"Agent {count}", panels[-1].border_title)
                     app.action_next_terminal()
+                    self.assertEqual(app.selected_panel, count + 1)
+                    app.action_next_terminal()
                     self.assertEqual(app.selected_terminal, 1)
-                    if count <= 9:
-                        await pilot.press(f"alt+{count}")
-                    else:
-                        app.action_previous_terminal()
+                    await pilot.press(f"ctrl+shift+{count % 10}")
                     self.assertEqual(app.selected_terminal, count)
                     app.action_toggle_fullscreen()
                     await pilot.pause()
@@ -313,7 +345,7 @@ class TuiSmokeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.screen, GroupContextScreen)
             app.screen.query_one("#context-request").load_text("Implement the feature")
             app.screen.query_one("#context-goal").load_text("Ship it")
-            app.screen.query_one("#context-sources").value = "spec.md, https://example.test"
+            app.screen.query_one("#context-sources").load_text("spec.md\nhttps://example.test")
             app.screen.query_one("#context-constraints").load_text("Keep compatibility")
             await pilot.click("#confirm")
             await pilot.pause()
@@ -493,8 +525,14 @@ class TuiSmokeTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(app.clipboard, "TASK")
 
-    def test_hypervisor_hotkeys_do_not_intercept_qwen_shortcuts(self) -> None:
+    async def test_hypervisor_hotkeys_do_not_intercept_qwen_shortcuts(self) -> None:
         qwen_shortcuts = {
+            "f1",
+            "f5",
+            "f12",
+            "ctrl+g",
+            "ctrl+i",
+            "ctrl+m",
             "escape",
             "enter",
             "tab",
@@ -546,8 +584,19 @@ class TuiSmokeTests(unittest.IsolatedAsyncioTestCase):
             "ctrl+shift+down",
             "ctrl+shift+z",
         }
-        hypervisor_shortcuts = {binding.key for binding in HypervisorApp.BINDINGS}
-        self.assertTrue(hypervisor_shortcuts.isdisjoint(qwen_shortcuts))
+        backend = PopulatedBackend()
+        app = HypervisorApp(backend=backend)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.click("#terminal-1")
+            await pilot.press(*sorted(qwen_shortcuts))
+            await pilot.pause()
+            forwarded = {op[3] for op in backend.input_ops if op[0] == "key"}
+            self.assertTrue(qwen_shortcuts.issubset(forwarded), qwen_shortcuts - forwarded)
+            self.assertIs(app.screen, app._main_screen)
+            self.assertIsInstance(app.focused, TerminalPanel)
+            self.assertNotIn("ctrl+q", app._bindings.key_to_bindings)
+            self.assertNotIn("ctrl+p", app._bindings.key_to_bindings)
 
     async def test_app_mounts_without_groups(self) -> None:
         app = HypervisorApp(backend=EmptyBackend())

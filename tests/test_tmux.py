@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
 
 from agent_hypervisor.models import HypervisorError
+from agent_hypervisor.state import StateStore
 from agent_hypervisor.tmux import TmuxBackend, normalize_key
 
 
@@ -13,9 +16,17 @@ def completed(args: list[str], code: int = 0, stdout: str = "", stderr: str = ""
 
 
 class TmuxBackendTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="hypervisor-tmux-unit-")
+        self.addCleanup(temporary.cleanup)
+        self.state = StateStore(Path(temporary.name) / "groups.json")
+
+    def make_backend(self, **kwargs):
+        return TmuxBackend(state_store=self.state, **kwargs)
+
     def test_default_command_launches_qwen_through_npm_exec(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
-            backend = TmuxBackend(runner=Mock())
+            backend = self.make_backend(runner=Mock())
         self.assertEqual(
             backend.agent_command,
             ("npm", "exec", "--yes", "--package=@qwen-code/qwen-code", "--", "qwen"),
@@ -28,6 +39,8 @@ class TmuxBackendTests(unittest.TestCase):
 
     def test_normalize_control_key(self) -> None:
         self.assertEqual(normalize_key("ctrl-q"), "C-q")
+        self.assertEqual(normalize_key("ctrl+right_square_bracket"), "C-]")
+        self.assertEqual(normalize_key("ctrl+shift+at"), "C-S-@")
         self.assertEqual(normalize_key("enter"), "Enter")
         self.assertEqual(normalize_key("F12"), "F12")
         self.assertEqual(normalize_key("shift+up"), "S-Up")
@@ -45,7 +58,7 @@ class TmuxBackendTests(unittest.TestCase):
             return completed(args, stdout=rows)
 
         runner = Mock(side_effect=run)
-        backend = TmuxBackend(runner=runner)
+        backend = self.make_backend(runner=runner)
         prompt = "hello; $(safe)\nsecond line"
         backend.send_text("123", 1, prompt)
         calls = [call.args[0] for call in runner.call_args_list]
@@ -67,7 +80,7 @@ class TmuxBackendTests(unittest.TestCase):
                 ),
             )
         )
-        status = TmuxBackend(runner=runner).status("123")
+        status = self.make_backend(runner=runner).status("123")
 
         self.assertEqual(runner.call_count, 1)
         self.assertEqual(status.attached_clients, 2)
@@ -76,7 +89,7 @@ class TmuxBackendTests(unittest.TestCase):
 
     def test_capture_uses_one_tmux_process(self) -> None:
         runner = Mock(return_value=completed([], stdout="screen\n"))
-        output = TmuxBackend(runner=runner).capture("123", 1, lines=0)
+        output = self.make_backend(runner=runner).capture("123", 1, lines=0)
 
         self.assertEqual(output, "screen")
         self.assertEqual(runner.call_count, 1)

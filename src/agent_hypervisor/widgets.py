@@ -5,7 +5,9 @@ from rich.style import Style
 from textual import events
 from textual.message import Message
 from textual.widget import Widget
-from textual.widgets import Button
+from textual.selection import Selection
+from textual.strip import Strip
+from textual.widgets import Button, RichLog
 
 from .config import (
     ROADMAP_ACTIVE_PATTERN,
@@ -14,6 +16,37 @@ from .config import (
     TEXT,
     WORKFLOW_STATE_LABELS,
 )
+
+
+class SelectableLog(RichLog):
+    def get_selection(self, selection: Selection) -> tuple[str, str]:
+        text = "\n".join(line.text for line in self.lines)
+        # Dragging below the last rendered line must not index past the content.
+        if selection.start is not None and selection.start.y >= len(self.lines):
+            return "", "\n"
+        return selection.extract(text).rstrip(), "\n"
+
+    def render_line(self, y: int) -> Strip:
+        scroll_x, scroll_y = self.scroll_offset
+        row = scroll_y + y
+        selection = self.text_selection
+        if selection is not None and row < len(self.lines):
+            text = Text.assemble(*((segment.text, segment.style) for segment in self.lines[row]))
+            span = selection.get_span(row)
+            if span is not None:
+                start, end = span
+                text.stylize(
+                    self.screen.get_component_rich_style("screen--selection"),
+                    start,
+                    len(text) if end == -1 else end,
+                )
+            line = Strip(text.render(self.app.console))
+            line = line.crop_extend(
+                scroll_x, scroll_x + self.scrollable_content_region.width, self.rich_style
+            )
+        else:
+            line = super().render_line(y)
+        return line.apply_offsets(scroll_x, row)
 
 
 class HypervisorButton(Button):

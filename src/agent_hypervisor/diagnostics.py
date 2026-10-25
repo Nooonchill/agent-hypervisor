@@ -18,7 +18,6 @@ def log_path() -> Path:
 
 
 def configure_diagnostics() -> Path:
-    """Configure one bounded UTF-8 log file and return its path."""
     path = log_path()
     logger = logging.getLogger(LOGGER_NAME)
     if any(isinstance(handler, RotatingFileHandler) for handler in logger.handlers):

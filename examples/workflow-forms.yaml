@@ -8,7 +8,7 @@ task-form:
   goal:
     label: Общая цель
   sources:
-    label: Источники (через запятую)
+    label: Источники (по одному на строке)
   constraints:
     label: Ограничения
 
@@ -49,7 +49,7 @@ flows:
         visible: false
         default: Обновить документацию по запросу пользователя.
       sources:
-        label: Документы (через запятую)
+        label: Документы (по одному на строке)
         default: [README.md]
       constraints:
         visible: false

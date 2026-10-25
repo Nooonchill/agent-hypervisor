@@ -1,5 +1,4 @@
 version: 2
-agents-dir: examples/agents
 data-dir: .hypervisor
 
 task-form:
@@ -12,9 +11,12 @@ task-form:
     required: false
     default: ""
   sources:
-    label: Sources (comma separated)
+    label: Sources and context
+    type: multiline
+    description: References, links or background information in free text.
+    placeholder: Describe the available sources and context…
     required: false
-    default: []
+    default: ""
   constraints:
     label: Additional constraints
     required: false
@@ -24,14 +26,24 @@ agents:
   - agent-id: spec-writer
     agent-name: Spec Writer
     model: null
+    instructions: >-
+      You document the task requirements and acceptance criteria using the user's
+      request, constraints and available sources. Wait for an assigned stage before working.
 
   - agent-id: developer
     agent-name: Developer
     model: null
+    instructions: >-
+      You implement the assigned task and verify it with relevant tests.
+      Preserve unrelated work. Wait for an assigned stage before working.
 
   - agent-id: architect
     agent-name: Architect
     model: null
+    instructions: >-
+      You independently review assigned artifacts against the task requirements,
+      correctness and maintainability. Report concrete findings with evidence.
+      Wait for an assigned review before working.
 
 flows:
   - id: intent-implementation
@@ -44,14 +56,11 @@ flows:
     steps:
       - id: intent
         agent-id: spec-writer
-        goal: Create openspec/intent.md from the user's request, constraints, and available project context.
+        goal: Analyze the user's request, constraints, and available sources. Document requirements and acceptance criteria using locations appropriate to the task and repository.
         reviewer-id: architect
         review-goal: Confirm the intent captures the request, scope, requirements, and acceptance criteria without adding unsupported requirements.
         review-scope:
-          - openspec/intent.md
-        checks:
-          - id: intent-file-exists
-            command: [test, -f, openspec/intent.md]
+          - "**/*"
         auto-commit: false
         create-pr: false
         human-approval: false
@@ -64,7 +73,6 @@ flows:
         review-scope:
           - src/**
           - tests/**
-          - openspec/intent.md
         checks:
           - id: unit-tests
             command: [uv, run, python, -m, unittest, discover, -s, tests, -v]

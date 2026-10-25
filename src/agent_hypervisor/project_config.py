@@ -9,7 +9,7 @@ import yaml
 
 from .config import TERMINAL_COUNT, TERMINAL_LABEL
 from .models import HypervisorError
-from .task_form import DEFAULT_TASK_FORM, TaskFieldSpec
+from .task_form import DEFAULT_TASK_FORM, FIELD_TYPES, TaskFieldSpec
 
 AGENT_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 BRANCH_TYPES = ("feature", "fix", "refactor", "docs", "test", "chore")
@@ -56,8 +56,6 @@ class FlowSpec:
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
     agents: tuple[AgentSpec, ...]
-    # `flow` and `source` retain their original positional locations for callers
-    # and snapshots created before named workflows were introduced.
     flow: tuple[FlowStep, ...] = ()
     source: str = ""
     flows: tuple[FlowSpec, ...] = ()
@@ -211,6 +209,12 @@ def _bool(item: dict, key: str, label: str, default: bool = False) -> bool:
     return value
 
 
+def _form_hint(value: object, label: str) -> str:
+    if not isinstance(value, str) or "\0" in value:
+        raise HypervisorError(f"{label} must be a string")
+    return value
+
+
 def _task_form(
     value: object, base: tuple[TaskFieldSpec, ...] = DEFAULT_TASK_FORM, location: str = "task-form"
 ) -> tuple[TaskFieldSpec, ...]:
@@ -219,10 +223,22 @@ def _task_form(
     for field in base:
         label = f"{location}.{field.field_id}"
         item = _mapping(
-            entries.get(field.field_id, {}), label, {"label", "required", "default", "visible"}
+            entries.get(field.field_id, {}),
+            label,
+            {"label", "required", "default", "visible", "type", "description", "placeholder"},
         )
+        input_type = item.get("type", field.input_type)
+        if not isinstance(input_type, str) or input_type not in FIELD_TYPES:
+            raise HypervisorError(f"{label}.type must be text, multiline or string-list")
+        if field.field_id != "sources" and input_type == "string-list":
+            raise HypervisorError(f"{label}.type string-list is supported only for sources")
         default = item.get("default", field.default)
-        if field.field_id == "sources":
+        if input_type != field.input_type and "default" not in item:
+            if input_type == "string-list":
+                default = tuple(default.splitlines())
+            elif isinstance(default, tuple):
+                default = "\n".join(default)
+        if input_type == "string-list":
             if not isinstance(default, (list, tuple)):
                 raise HypervisorError(f"{label}.default must be a list of source strings")
             default = tuple(_string(source, f"{label}.default") for source in default)
@@ -243,6 +259,9 @@ def _task_form(
                 required,
                 default,
                 visible,
+                input_type,
+                _form_hint(item.get("description", field.description), f"{label}.description"),
+                _form_hint(item.get("placeholder", field.placeholder), f"{label}.placeholder"),
             )
         )
     return tuple(fields)
@@ -330,10 +349,12 @@ def load_project_config(
         raise HypervisorError("config.version must be 1 or 2")
     if version == 2 and "flow" in root:
         raise HypervisorError("config.version 2 uses 'flows', not 'flow'")
-    directory = Path(_string(root.get("agents-dir"), "agents-dir")).expanduser()
-    directory = (source.parent / directory).resolve()
-    if not directory.is_dir():
-        raise HypervisorError(f"Agent directory does not exist: {directory}")
+    directory = None
+    if "agents-dir" in root:
+        directory = Path(_string(root["agents-dir"], "agents-dir")).expanduser()
+        directory = (source.parent / directory).resolve()
+        if not directory.is_dir():
+            raise HypervisorError(f"Agent directory does not exist: {directory}")
     entries = root.get("agents")
     if not isinstance(entries, list) or not entries:
         raise HypervisorError("agents must be a non-empty list")
@@ -342,7 +363,7 @@ def load_project_config(
     legacy_agent_options: dict[str, tuple[str | None, bool]] = {}
     for index, entry in enumerate(entries, 1):
         label = f"agents[{index}]"
-        allowed = {"agent-id", "agent-name", "model"}
+        allowed = {"agent-id", "agent-name", "model", "instructions"}
         if version == 1:
             allowed |= {"reviewer-id", "create-pr"}
         item = _mapping(entry, label, allowed)
@@ -350,9 +371,17 @@ def load_project_config(
         if agent_id in ids:
             raise HypervisorError(f"Duplicate agent-id: {agent_id}")
         ids.add(agent_id)
-        description = (directory / f"{agent_id}.md").resolve()
-        if not description.is_relative_to(directory):
-            raise HypervisorError(f"Agent description must be inside {directory}")
+        description_path = ""
+        if "instructions" in item:
+            instructions = _string(item["instructions"], f"{label}.instructions")
+        else:
+            if directory is None:
+                raise HypervisorError(f"{label} requires instructions or agents-dir")
+            description = (directory / f"{agent_id}.md").resolve()
+            if not description.is_relative_to(directory):
+                raise HypervisorError(f"Agent description must be inside {directory}")
+            description_path = str(description)
+            instructions = _instructions(description)
         legacy_reviewer = _optional_string(item.get("reviewer-id"), f"{label}.reviewer-id")
         create_pr = _bool(item, "create-pr", label) if version == 1 else False
         legacy_agent_options[agent_id] = (legacy_reviewer, create_pr)
@@ -361,8 +390,8 @@ def load_project_config(
                 agent_id,
                 _string(item.get("agent-name"), f"{label}.agent-name"),
                 _optional_string(item.get("model"), f"{label}.model"),
-                str(description),
-                _instructions(description),
+                description_path,
+                instructions,
             )
         )
 
@@ -438,7 +467,6 @@ def load_project_config(
                 )
             )
 
-    # Keep the old flow view populated for consumers that still access it.
     compatible_flow = tuple(flows[0].steps) if flows else ()
     return ProjectConfig(
         tuple(agents),

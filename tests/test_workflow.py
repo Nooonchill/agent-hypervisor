@@ -45,6 +45,56 @@ class RecordingBackend(TmuxBackend):
 
 
 class WorkflowAcceptanceTests(unittest.TestCase):
+    def test_attempt_reports_are_separate_and_old_paths_remain_readable(self) -> None:
+        backend = self.make_backend(self.config((self.steps(human=True, pr=True)[0],)))
+        backend.create_group("TASK-1", self.repository, request="Test report layout")
+        worktree = Path(self.state.get("TASK-1").worktree_path)
+        (worktree / "result.txt").write_text("result\n")
+        self.start(backend)
+        attempt = self.current_attempt(backend)
+        self.submit(attempt, backend=backend)
+        self.approve_review(attempt, backend=backend)
+        directory = worktree / ".hypervisor" / "reports" / attempt
+        self.assertTrue((directory / "executor-prompt.txt").is_file())
+        self.assertTrue((directory / "reviewer-prompt.txt").is_file())
+        self.assertTrue((directory / "review.json").is_file())
+        self.assertIn(
+            "approved", backend.workflow.report("TASK-1", f"reports/{attempt}/review.json")
+        )
+        state = backend.workflow.human_decision(
+            "TASK-1", "implementation", attempt, False, "Improve the result"
+        )
+        next_attempt = state["stages"][0]["attempt"]
+        self.assertNotEqual(attempt, next_attempt)
+        self.assertEqual(state["stages"][0]["summary"], "")
+        self.assertEqual(state["stages"][0]["pr"], "")
+        self.assertTrue((directory / "review.json").is_file())
+        self.assertTrue((directory.parent / next_attempt / "executor-prompt.txt").is_file())
+        legacy = directory.parent / "older-report.txt"
+        legacy.write_text("Old report")
+        self.assertEqual(
+            backend.workflow.report("TASK-1", "reports/older-report.txt"), "Old report"
+        )
+
+    def test_free_text_sources_are_frozen_and_reach_both_roles(self) -> None:
+        form = tuple(
+            replace(field, input_type="multiline", default="")
+            if field.field_id == "sources"
+            else field
+            for field in DEFAULT_TASK_FORM
+        )
+        backend = self.make_backend(replace(self.config(self.steps()), task_form=form))
+        source = "Design notes, questions and references\nBackground context"
+        backend.create_group(
+            "TASK-1", self.repository, request="Test source context", sources=source
+        )
+        self.start(backend)
+        self.submit(self.current_attempt(backend), backend=backend)
+        self.assertEqual(backend.workflow.events("TASK-1")[0]["data"]["sources"], source)
+        for prompt in backend.prompts:
+            self.assertIn("Design notes, questions and references", prompt["prompt"])
+            self.assertIn("Background context", prompt["prompt"])
+
     def test_selected_flow_context_is_frozen_and_reaches_executor_and_reviewer(self) -> None:
         values = {
             "request": "Write the docs",
@@ -669,7 +719,9 @@ class WorkflowAcceptanceTests(unittest.TestCase):
         self.approve_review(attempt, backend=backend)
         self.assertEqual(backend.workflow.status("TASK-1")["state"], "completed")
         pr = next(e for e in backend.workflow.events("TASK-1") if e["type"] == "pr.requested")
-        self.assertEqual(pr["data"]["status"], "not_integrated")
+        self.assertEqual(pr["data"]["status"], "external_mcp")
+        self.assertIn("separately configured corporate MCP", backend.prompts[0]["prompt"])
+        self.assertIn("must not block the workflow", backend.prompts[0]["prompt"])
 
     def test_repeated_stage_review_human_callbacks_are_idempotent(self) -> None:
         backend = self.make_backend(self.config(self.steps(human=True)))

@@ -13,6 +13,7 @@ class ActionSpec:
     button_id: str | None = None
     icon: str = ""
     tooltip: str = ""
+    scope: str = "manager"
 
     def tooltip_for(self, label: str | None = None) -> str:
         text = label if label is not None else self.tooltip
@@ -29,6 +30,65 @@ TERMINAL_LABEL = "TERMINAL {number}"
 SESSION_LABEL = "terminal-{terminal}-{session_id}"
 AGENT_SESSION_LABEL = "{agent_id}-{session_id}"
 TERMINAL_RENDER_LINES = 2_000
+EVENT_LOG_MAX_LINES = 2_000
+EVENT_LOG_INITIAL_EVENTS = 200
+EVENT_LOG_DETAIL_LIMIT = 1_200
+EVENT_LOG_HUMAN_READABLE = True
+EVENT_LOG_FORMAT_ICONS = {True: "{}", False: "≡"}
+EVENT_LOG_TITLES = {
+    "task.created": "Группа создана",
+    "stage.started": "Начата работа над этапом",
+    "stage.submitted": "Исполнитель передал результат",
+    "stage.completed": "Этап завершён",
+    "delivery.started": "Отправляется задание агенту",
+    "delivery.completed": "Задание доставлено",
+    "delivery.deferred": "Отправка отложена: агент в ручном режиме",
+    "checks.passed": "Проверки пройдены",
+    "checks.failed": "Проверки не пройдены",
+    "commit.started": "Создаётся коммит",
+    "commit.created": "Коммит готов для ревью",
+    "review.started": "Начато независимое ревью",
+    "review.submitted": "Получен результат ревью",
+    "review.approved": "Ревьюер подтвердил результат",
+    "review.changes_requested": "Ревьюер вернул работу на доработку",
+    "review.blocked": "Работа заблокирована: требуется вмешательство",
+    "human.requested": "Требуется подтверждение человека",
+    "human.approved": "Пользователь подтвердил результат",
+    "human.changes_requested": "Пользователь вернул работу на доработку",
+    "agent.mode_changed": "Изменён режим агента",
+    "workflow.completed": "Workflow завершён",
+    "pr.requested": "Для этапа запрошено создание PR",
+    "error": "Ошибка workflow",
+}
+EVENT_LOG_FIELDS = {
+    "request": "Запрос",
+    "goal": "Общая цель",
+    "sources": "Источники",
+    "constraints": "Ограничения",
+    "summary": "Результат",
+    "message": "Сообщение",
+    "comment": "Комментарий",
+    "findings": "Замечание",
+    "report": "Отчёт",
+    "sha": "Коммит",
+    "branch": "Ветка",
+    "log": "Лог ошибки",
+    "agent_id": "Агент",
+    "executor": "Исполнитель",
+    "reviewer": "Ревьюер",
+}
+EVENT_LOG_MODE_LABELS = {"manual": "ручное управление", "workflow": "workflow"}
+EVENT_LOG_STYLES = {
+    "error": "red",
+    "checks.failed": "red",
+    "review.blocked": "red",
+    "review.changes_requested": "yellow",
+    "human.requested": "yellow",
+    "human.changes_requested": "yellow",
+    "stage.completed": "green",
+    "workflow.completed": "green",
+    "review.approved": "green",
+}
 
 STATE_REFRESH_SECONDS = 1.0
 OUTPUT_REFRESH_SECONDS = 0.10
@@ -66,11 +126,19 @@ WORKFLOW_STATE_LABELS = {
 }
 
 ACTIONS = {
-    "quit": ActionSpec("quit", "f12", "Quit", show=True),
-    "copy_selection": ActionSpec("copy_selection", "f11,ctrl+shift+c", "Copy", show=True),
+    "toggle_event_log_format": ActionSpec(
+        "toggle_event_log_format",
+        "",
+        "Event format",
+        button_id="event-log-format",
+        icon=EVENT_LOG_FORMAT_ICONS[EVENT_LOG_HUMAN_READABLE],
+        tooltip="Показать технические данные событий",
+    ),
+    "quit": ActionSpec("quit", "ctrl+x", "Quit", show=True),
+    "copy_selection": ActionSpec("copy_selection", "ctrl+shift+c", "Copy", show=True),
     "create_group": ActionSpec(
         "create_group",
-        "f9",
+        "ctrl+n",
         "New group",
         show=True,
         button_id="create-group",
@@ -78,20 +146,27 @@ ACTIONS = {
         tooltip="Create group",
     ),
     "rename_group": ActionSpec(
-        "rename_group", "f10", "Rename", button_id="rename-group", icon="✎", tooltip="Rename group"
+        "rename_group",
+        "ctrl+r",
+        "Rename",
+        button_id="rename-group",
+        icon="✎",
+        tooltip="Rename group",
     ),
     "remove_group": ActionSpec(
         "remove_group",
-        "",
+        "ctrl+d",
         "Delete group",
         button_id="remove-group",
         icon="×",
         tooltip="Delete group",
     ),
-    "toggle_fullscreen": ActionSpec("toggle_fullscreen", "f5", "Focus/grid", show=True),
+    "toggle_fullscreen": ActionSpec(
+        "toggle_fullscreen", "alt+z", "Zoom/grid", show=True, scope="global"
+    ),
     "toggle_group_active": ActionSpec(
         "toggle_group_active",
-        "f6",
+        "",
         "Activate/deactivate",
         show=True,
         button_id="activate-group",
@@ -100,7 +175,7 @@ ACTIONS = {
     ),
     "restart_terminal": ActionSpec(
         "restart_terminal",
-        "f7",
+        "",
         "Start/restart",
         show=True,
         button_id="start-button",
@@ -109,7 +184,7 @@ ACTIONS = {
     ),
     "stop_terminal": ActionSpec(
         "stop_terminal",
-        "f8",
+        "",
         "Stop",
         button_id="stop-button",
         icon="■",
@@ -131,24 +206,59 @@ ACTIONS = {
         icon="▶",
         tooltip="Start or resume workflow",
     ),
-    "previous_group": ActionSpec("previous_group", "alt+up", "Previous group"),
-    "next_group": ActionSpec("next_group", "alt+down", "Next group"),
-    "previous_terminal": ActionSpec("previous_terminal", "f3", "Previous agent"),
-    "next_terminal": ActionSpec("next_terminal", "f4", "Next agent"),
+    "previous_group": ActionSpec("previous_group", "ctrl+up", "Previous group"),
+    "next_group": ActionSpec("next_group", "ctrl+down", "Next group"),
+    "previous_terminal": ActionSpec("previous_terminal", "shift+tab", "Previous panel"),
+    "next_terminal": ActionSpec("next_terminal", "tab", "Next panel"),
 }
 
+ACTIONS["toggle_terminal_input"] = ActionSpec(
+    "toggle_terminal_input", "alt+h", "Input/manage", show=True, scope="global"
+)
 ACTIONS.update(
     {
-        f"select_terminal_{number}": ActionSpec(
-            f"select_terminal({number})",
-            f"alt+{number}",
-            TERMINAL_LABEL.format(number=number).title(),
+        f"move_terminal_{direction}": ActionSpec(
+            f"move_terminal('{direction}')", f"ctrl+shift+{direction}", f"Panel {direction}"
         )
-        for number in range(1, 10)
+        for direction in ("up", "down", "left", "right")
     }
 )
+for number in range(1, 11):
+    digit = str(number % 10)
+    shifted = (
+        "right_parenthesis",
+        "exclamation_mark",
+        "at",
+        "number_sign",
+        "dollar_sign",
+        "percent_sign",
+        "circumflex_accent",
+        "ampersand",
+        "asterisk",
+        "left_parenthesis",
+    )[number % 10]
+    ACTIONS[f"select_terminal_{number}"] = ActionSpec(
+        f"select_terminal({number})",
+        f"ctrl+shift+{digit},ctrl+shift+{shifted},ctrl+{shifted}",
+        TERMINAL_LABEL.format(number=number).title(),
+    )
+    ACTIONS[f"select_group_{number}"] = ActionSpec(
+        f"select_group({number})", f"ctrl+{digit}", f"Group {number}"
+    )
+
 
 TEXT = {
+    "keyboard_input": "AGENT INPUT · {key} → управление",
+    "keyboard_manager": "УПРАВЛЕНИЕ · {key} → ввод агента",
+    "keyboard_events": "EVENTS · только чтение",
+    "keyboard_dialog": "Диалог · Esc → назад",
+    "event_log_human_tooltip": "Показать понятные описания событий",
+    "event_log_check_passed": "пройдена",
+    "event_log_check_failed": "ошибка (код {code})",
+    "event_log_actor_human": "Пользователь",
+    "event_log_title": "EVENTS · read only",
+    "event_log_empty": "No workflow events yet.",
+    "event_log_unavailable": "Cannot read workflow events: {error}",
     "app_title": "Agent Hypervisor",
     "app_subtitle": "tmux control plane",
     "brand": "AGENT\nHYPERVISOR",
@@ -180,17 +290,15 @@ TEXT = {
     "group_title": "TASK GROUP  ·  {group_id}",
     "group_state": "{state}",
     "activate_group": "Activate group",
-    "terminal_inactive": "Group is inactive.\n\nPress Activate group ({activate_key}) to launch its Qwen agents.",
-    "terminal_stopped": "Stopped by Hypervisor.\n\nUse Start above this terminal (or press {start_key}).",
-    "terminal_exited": "Qwen exited (code {exit_code}).\n\nUse Start above this terminal (or press {start_key}).",
+    "terminal_inactive": "Group is inactive.\n\nUse Activate group in the sidebar to launch its Qwen agents.",
+    "terminal_stopped": "Stopped by Hypervisor.\n\nUse Start above this terminal.",
+    "terminal_exited": "Qwen exited (code {exit_code}).\n\nUse Start above this terminal.",
     "terminal_missing": "Terminal is missing. Select it and press Start.",
     "terminal_is_stopped": "This terminal is stopped. Press Start first.",
     "start_tooltip": "Start selected terminal",
     "restart_tooltip": "Restart selected terminal",
     "deactivate_tooltip": "Deactivate group",
     "activate_tooltip": "Activate group",
-    "start_key": ACTIONS["restart_terminal"].keys.upper(),
-    "activate_key": ACTIONS["toggle_group_active"].keys.upper(),
     "terminal_start_notification": "{terminal_label}: {action}",
     "inactive_state": "INACTIVE",
     "agent_manual_badge": "MANUAL",
@@ -226,7 +334,7 @@ TEXT = {
     "context_help": "Add the initial request and shared context for the workflow.",
     "context_request": "Initial request",
     "context_goal": "Overall goal",
-    "context_sources": "Sources (comma separated)",
+    "context_sources": "Sources",
     "context_constraints": "Additional constraints",
     "context_required": "Fill in the required field: {label}",
     "context_required_label": "{label} *",

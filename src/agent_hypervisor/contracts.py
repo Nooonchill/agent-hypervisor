@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from .models import GroupStatus
-from .state import AgentSession
+from .state import AgentSession, StateStore
 
 if TYPE_CHECKING:
     from .project_config import ProjectConfig
@@ -12,8 +12,6 @@ if TYPE_CHECKING:
 
 
 class HypervisorBackend(Protocol):
-    """Control-plane contract shared by TUI, CLI adapters and future integrations."""
-
     project_config: ProjectConfig
 
     @property
@@ -28,7 +26,7 @@ class HypervisorBackend(Protocol):
         flow_id: str | None = None,
         request: str | None = None,
         goal: str | None = None,
-        sources: tuple[str, ...] | None = None,
+        sources: str | tuple[str, ...] | None = None,
         constraints: str | None = None,
     ) -> GroupStatus: ...
 
@@ -65,3 +63,33 @@ class HypervisorBackend(Protocol):
         width: int,
         height: int,
     ) -> None: ...
+
+
+class WorkflowBackend(Protocol):
+    state: StateStore
+    project_config: ProjectConfig
+
+    def workflow_session(self, group_id: str, agent_id: str, session_id: str) -> int: ...
+
+    def queue_prompt(
+        self, group_id: str, terminal: int, text: str, *, wait_ready: bool = False
+    ) -> None: ...
+
+
+class WorkflowOperations(Protocol):
+    def validate_agent_session(self, group: str, agent: str, session: str) -> None: ...
+    def events(self, group: str) -> list[dict]: ...
+    def report(self, group: str, path: str) -> str: ...
+    def complete(
+        self, group: str, step_id: str, attempt: str, summary: str, session_id: str = ""
+    ) -> dict: ...
+    def submit_review(
+        self,
+        group: str,
+        step_id: str,
+        attempt: str,
+        decision: str,
+        summary: str,
+        findings: list[str] | None = None,
+        session_id: str = "",
+    ) -> dict: ...

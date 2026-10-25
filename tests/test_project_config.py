@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import shlex
 import unittest
 from pathlib import Path
 
@@ -13,6 +14,77 @@ from agent_hypervisor.tmux import TmuxBackend
 
 
 class ProjectConfigTests(unittest.TestCase):
+    def test_field_types_descriptions_and_flow_overrides(self) -> None:
+        self.payload["task-form"] = {
+            "sources": {
+                "default": ["a,b.md"],
+                "description": "Source context",
+                "placeholder": "Paste sources",
+            },
+            "request": {"type": "text"},
+        }
+        self.payload["flows"][0]["task-form"] = {"sources": {"type": "multiline"}}
+        config = self.load()
+        fields = {field.field_id: field for field in config.form_for_flow()}
+        self.assertEqual(fields["request"].input_type, "text")
+        self.assertEqual(fields["sources"].input_type, "multiline")
+        self.assertEqual(fields["sources"].default, "a,b.md")
+        self.assertEqual(fields["sources"].description, "Source context")
+        self.assertEqual(fields["sources"].placeholder, "Paste sources")
+        self.assertEqual(config.task_form[2].input_type, "string-list")
+
+    def test_invalid_field_types_and_hints_are_rejected(self) -> None:
+        for settings in (
+            {"sources": {"type": "number"}},
+            {"request": {"type": "string-list"}},
+            {"sources": {"type": "multiline", "default": []}},
+            {"goal": {"placeholder": 1}},
+            {"goal": {"description": None}},
+        ):
+            with self.subTest(settings=settings):
+                self.payload["task-form"] = settings
+                with self.assertRaises(HypervisorError):
+                    self.load()
+
+    def test_all_agent_instructions_can_live_in_yaml_without_a_directory(self) -> None:
+        self.payload.pop("agents-dir")
+        for agent in self.payload["agents"]:
+            agent["instructions"] = f"Instructions for {agent['agent-id']}\nUse the task sources."
+        config = self.load()
+        for agent in config.agents:
+            self.assertEqual(agent.description_path, "")
+            self.assertIn(agent.agent_id, agent.instructions)
+        command = TmuxBackend(project_config=config)._qwen_command(
+            "session", terminal=1, resume=False
+        )
+        args = shlex.split(command)
+        self.assertEqual(
+            args[args.index("--append-system-prompt") + 1], config.agents[0].instructions
+        )
+
+    def test_inline_instructions_take_precedence_and_can_mix_with_files(self) -> None:
+        self.payload["agents"][0]["instructions"] = "Inline developer instructions."
+        directory = self.root / self.payload["agents-dir"]
+        (directory / "developer.md").unlink()
+        config = self.load()
+        self.assertEqual(config.agents[0].instructions, "Inline developer instructions.")
+        self.assertEqual(config.agents[0].description_path, "")
+        self.assertEqual(config.agents[1].instructions, "You are architect.")
+        self.assertTrue(config.agents[1].description_path.endswith("architect.md"))
+
+    def test_inline_instructions_must_be_nonempty_strings(self) -> None:
+        for value in (None, True, "", " ", ["instruction"], "bad\0value"):
+            with self.subTest(value=value):
+                self.payload["agents"][0]["instructions"] = value
+                with self.assertRaisesRegex(
+                    HypervisorError, "instructions must be a non-empty string"
+                ):
+                    self.load()
+        self.payload["agents"][0].pop("instructions")
+        self.payload.pop("agents-dir")
+        with self.assertRaisesRegex(HypervisorError, "requires instructions or agents-dir"):
+            self.load()
+
     def test_workflow_forms_inherit_globals_without_leaking_overrides(self) -> None:
         self.payload["task-form"] = {
             "request": {"label": "Global request", "required": True},

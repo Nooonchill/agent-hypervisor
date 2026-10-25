@@ -142,8 +142,6 @@ def flow_step_from_dict(item: dict[str, Any]) -> FlowStep:
 
 
 class StateStore:
-    """Small atomic JSON registry shared by the TUI and CLI."""
-
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_state_path()
 

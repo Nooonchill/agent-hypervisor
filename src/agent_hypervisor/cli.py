@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -22,6 +23,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("tui", help="open the interactive Textual interface")
+    mcp = subparsers.add_parser("mcp", help="MCP server and Qwen settings.json configuration")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp_sub.add_parser("config", help="print a fragment to merge into Qwen settings.json")
+    serve = mcp_sub.add_parser("serve", help="run the session-bound stdio MCP server")
+    for flag, variable in (
+        ("group", "HYPERVISOR_GROUP"),
+        ("agent", "HYPERVISOR_AGENT"),
+        ("session", "HYPERVISOR_SESSION"),
+    ):
+        serve.add_argument(f"--{flag}", default=os.environ.get(variable))
+    serve.add_argument("--state-path", type=Path, default=os.environ.get("HYPERVISOR_STATE_PATH"))
     logs = subparsers.add_parser("logs", help="show recent diagnostic log entries")
     logs.add_argument("--lines", type=int, default=100)
     subparsers.add_parser(
@@ -215,6 +227,28 @@ def main(argv: list[str] | None = None) -> int:
         print(read_log_tail(args.lines))
         return 0
     try:
+        if args.command == "mcp":
+            if args.mcp_command == "config":
+                from .mcp_config import qwen_settings
+
+                print(json.dumps(qwen_settings(), ensure_ascii=False, indent=2))
+                return 0
+            from .agent_api import AgentBinding
+            from .mcp_server import create_server
+            from .state import StateStore
+
+            if not all((args.group, args.agent, args.session)):
+                raise HypervisorError(
+                    "MCP requires group, agent and session identity; launch it from a Hypervisor-managed Qwen session or pass --group, --agent and --session"
+                )
+            backend = TmuxBackend(
+                state_store=StateStore(args.state_path) if args.state_path else StateStore(),
+                project_config=ProjectConfig.default(),
+            )
+            create_server(backend.workflow, AgentBinding(args.group, args.agent, args.session)).run(
+                transport="stdio"
+            )
+            return 0
         reads_yaml = args.command in (None, "tui", "check-config", "create")
         project_config = load_project_config(args.config) if reads_yaml else ProjectConfig.default()
         if args.command == "check-config":

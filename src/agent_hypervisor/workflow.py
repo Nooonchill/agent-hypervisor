@@ -18,7 +18,7 @@ from .project_config import CheckSpec, FlowStep
 from .state import GroupRecord, flow_step_from_dict
 
 if TYPE_CHECKING:
-    from .tmux import TmuxBackend
+    from .contracts import WorkflowBackend
 
 
 def project_events(events: list[dict]) -> dict:
@@ -63,7 +63,16 @@ def project_events(events: list[dict]) -> dict:
             continue
         kind, data = event["type"], event["data"]
         if kind == "stage.started":
-            stage.update(attempt=event["attempt"], error="", checks=[], review={}, commit="")
+            stage.update(
+                attempt=event["attempt"],
+                summary="",
+                error="",
+                checks=[],
+                review={},
+                commit="",
+                pr="",
+                waiting_agent="",
+            )
         if kind in states:
             stage["state"] = states[kind]
         if kind == "delivery.completed":
@@ -87,7 +96,7 @@ def project_events(events: list[dict]) -> dict:
             if kind == "review.changes_requested":
                 stage["state"] = "changes-requested"
         elif kind == "pr.requested":
-            stage["pr"] = "not_integrated"
+            stage["pr"] = data["status"]
         elif kind == "error":
             stage["error"] = data["message"]
     current = next((item for item in stages.values() if item["state"] != "completed"), None)
@@ -106,9 +115,9 @@ def project_events(events: list[dict]) -> dict:
 
 
 class WorkflowService:
-    """Event-driven operations. Agent CLI callbacks advance work without the TUI."""
+    """Submissions drive transitions independently of the TUI."""
 
-    def __init__(self, backend: TmuxBackend) -> None:
+    def __init__(self, backend: WorkflowBackend) -> None:
         self.backend = backend
 
     def _record(self, group: str) -> GroupRecord:
@@ -116,6 +125,16 @@ class WorkflowService:
         if record is None:
             raise HypervisorError(f"Unknown task group: {group}")
         return record
+
+    def validate_agent_session(self, group: str, agent: str, session: str) -> None:
+        record = self._record(group)
+        number = next(
+            (i for i, spec in enumerate(record.terminal_agents, 1) if spec.agent_id == agent), None
+        )
+        if number is None or not any(
+            item.session_id == session for item in record.sessions.get(number, [])
+        ):
+            raise HypervisorError("Session identity does not belong to this agent and task group")
 
     def _store(self, group: str) -> EventStore:
         record = self._record(group)
@@ -139,7 +158,7 @@ class WorkflowService:
         *,
         request: str,
         goal: str = "",
-        sources: tuple[str, ...] = (),
+        sources: str | tuple[str, ...] = (),
         constraints: str = "",
     ) -> None:
         record = self._record(group)
@@ -159,7 +178,7 @@ class WorkflowService:
                 agents=[asdict(agent) for agent in record.agents],
                 request=request,
                 goal=goal or request,
-                sources=list(sources),
+                sources=sources if isinstance(sources, str) else list(sources),
                 constraints=constraints,
                 task_form=[
                     asdict(field)
@@ -314,13 +333,14 @@ class WorkflowService:
             raise HypervisorError("Stale or incorrect stage/attempt; inspect workflow status")
         return stage, step
 
-    def _save_report(self, store: EventStore, name: str, value: str) -> str:
-        path = store.report(f"reports/{name}")
+    def _save_report(self, store: EventStore, attempt: str, name: str, value: str) -> str:
+        relative = f"reports/{attempt}/{name}"
+        path = store.report(relative)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
         temporary.write_text(value, encoding="utf-8")
         os.replace(temporary, path)
-        return f"reports/{name}"
+        return relative
 
     def _cli(self) -> str:
         # Absolute interpreter + source path work from a task worktree, including uv installs.
@@ -388,14 +408,27 @@ class WorkflowService:
             f"Stage goal: {step.goal}\nPrevious completed stages:\n"
             f"{json.dumps(completed, ensure_ascii=False, indent=2)}\n"
             f"Hard gates to satisfy: {json.dumps([asdict(check) for check in step.checks], ensure_ascii=False)}\n"
-            "Use project documents (including openspec/intent.md if present) as the shared task context.\n"
+            "Use the sources and document locations specified by this task and its workflow as shared context.\n"
             f"Feedback for this attempt: {feedback or 'Initial attempt'}\n"
             + (
                 "Hypervisor will commit after hard gates pass.\n"
                 if step.auto_commit
                 else "Commit your changes before requesting completion; review requires a clean worktree.\n"
             )
-            + f"When finished, run this command with your actual summary:\n{command}\n"
+            + (
+                "This stage requests a PR. Use the separately configured corporate MCP to create "
+                "the PR, following that tool's requirements. Include the PR URL in your completion "
+                "summary. If the tool is unavailable or creation fails, describe the problem in "
+                "your summary and still submit completion; PR creation must not block the workflow. "
+                "Leave merging to the user.\n"
+                if step.create_pr
+                else ""
+            )
+            + f"MCP assignment: step_id={step.step_id}, attempt={attempt}. "
+            "Use the Agent Hypervisor MCP tools workflow_status, task_context and read_report to inspect shared state. "
+            "When finished, call complete_stage with this exact step_id, attempt and your actual summary. "
+            "If MCP is not connected, the equivalent CLI fallback is:\n"
+            f"{command}\n"
             "A successful submission is only a request: the Hypervisor runs gates and independent review. "
             "Do not submit review or human decisions yourself. After submitting, wait for the next queued instruction."
         )
@@ -415,7 +448,7 @@ class WorkflowService:
         role: str,
     ) -> None:
         group = self._record(group).group_id
-        report = self._save_report(store, f"{attempt}-{role}-prompt.txt", prompt)
+        report = self._save_report(store, attempt, f"{role}-prompt.txt", prompt)
         delivery = dict(role=role, session_id=session_id, agent_id=agent_id, report=report)
         with store.agent_gate(agent_id):
             if self.agent_mode(group, agent_id) == "manual":
@@ -501,7 +534,7 @@ class WorkflowService:
     def _run_check(
         self, record: GroupRecord, store: EventStore, attempt: str, check: CheckSpec
     ) -> dict:
-        relative = f"reports/{attempt}-check-{check.check_id}.log"
+        relative = f"reports/{attempt}/check-{check.check_id}.log"
         path = store.report(relative)
         path.parent.mkdir(parents=True, exist_ok=True)
         code = -1
@@ -550,7 +583,8 @@ class WorkflowService:
             if not failed and (dirty or not head):
                 report = self._save_report(
                     store,
-                    f"{attempt}-clean-worktree.log",
+                    attempt,
+                    "clean-worktree.log",
                     "Commit all changes before review.\n"
                     + (dirty or "Repository has no commit (HEAD)."),
                 )
@@ -603,7 +637,7 @@ class WorkflowService:
                 "findings": [],
             }
             data["report"] = self._save_report(
-                store, f"{attempt}-review-gate.json", json.dumps(data, ensure_ascii=False, indent=2)
+                store, attempt, "review-gate.json", json.dumps(data, ensure_ascii=False, indent=2)
             )
             store.append("review.blocked", stage=stage, attempt=attempt, **data)
             return False
@@ -638,7 +672,11 @@ class WorkflowService:
             f"Review head commit: {head}\n"
             "Inspect only the given project artifacts and relevant diff. Do not modify, stage, or commit files. "
             "Do not inspect unrelated host directories. Use your fresh context for independent judgment.\n"
-            "When done, submit a structured decision via this CLI command (edit values):\n"
+            f"MCP assignment: step_id={step.step_id}, attempt={attempt}. "
+            "Read context and history via task_context, workflow_events and read_report. "
+            "When done, call Agent Hypervisor MCP submit_review with this exact step_id, attempt, "
+            "decision, nonempty summary and concrete findings. "
+            "If MCP is not connected, the equivalent CLI fallback is (edit values):\n"
             f"{command}\nValid decisions: approved, changes_requested, blocked. "
             "Repeat --finding for concrete remarks; omit it if there are none. "
             "Hypervisor checks that both HEAD and the worktree remain unchanged after review. "
@@ -691,7 +729,7 @@ class WorkflowService:
                 )
                 decision = "blocked"
             report = self._save_report(
-                store, f"{attempt}-review.json", json.dumps(data, ensure_ascii=False, indent=2)
+                store, attempt, "review.json", json.dumps(data, ensure_ascii=False, indent=2)
             )
             data["report"] = report
             store.append(
@@ -709,9 +747,7 @@ class WorkflowService:
     def _after_review(self, group: str, store: EventStore, step: FlowStep, attempt: str) -> None:
         events = store.read()
         if step.create_pr and not self._find(events, "pr.requested", step.step_id, attempt):
-            store.append(
-                "pr.requested", stage=step.step_id, attempt=attempt, status="not_integrated"
-            )
+            store.append("pr.requested", stage=step.step_id, attempt=attempt, status="external_mcp")
         if step.human_approval:
             if not self._find(store.read(), "human.requested", step.step_id, attempt):
                 store.append("human.requested", stage=step.step_id, attempt=attempt)

@@ -13,8 +13,6 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.message import Message
 from textual.screen import Screen
-from textual.selection import Selection
-from textual.strip import Strip
 from textual.widgets import (
     Button,
     Footer,
@@ -22,7 +20,6 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
-    RichLog,
     Static,
 )
 
@@ -33,6 +30,8 @@ from .config import (
     AGENT_MODE_ICONS,
     BACKGROUND_REFRESH_DIVISOR,
     CAPTURE_HISTORY_LINES,
+    EVENT_LOG_HUMAN_READABLE,
+    EVENT_LOG_FORMAT_ICONS,
     GROUP_MARKERS,
     INPUT_BATCH_SECONDS,
     OUTPUT_REFRESH_SECONDS,
@@ -60,9 +59,12 @@ from .dialogs import (
     WorktreeDispositionScreen,
 )
 from .models import GroupStatus, HypervisorError, TerminalState
+from .keyboard import preserve_alt_with_associated_text
 from .project_config import ProjectConfig
 from .tmux import TmuxBackend
-from .widgets import HypervisorButton, WorkflowRoadmap
+from .widgets import HypervisorButton, SelectableLog, WorkflowRoadmap
+from .event_log import WorkflowEventLog
+from .workflow import project_events
 from .task_form import DEFAULT_TASK_FORM
 
 LOGGER = logging.getLogger(f"{LOGGER_NAME}.tui")
@@ -75,7 +77,7 @@ class GroupItem(ListItem):
         self.group_id = status.group_id
 
 
-class TerminalPanel(RichLog):
+class TerminalPanel(SelectableLog):
     can_focus = True
 
     class Selected(Message):
@@ -121,35 +123,6 @@ class TerminalPanel(RichLog):
         self.clear()
         self.write(content, scroll_end=False, animate=False)
 
-    def get_selection(self, selection: Selection) -> tuple[str, str]:
-        text = "\n".join(line.text for line in self.lines)
-        # Dragging below the last rendered line must not index past the content.
-        if selection.start is not None and selection.start.y >= len(self.lines):
-            return "", "\n"
-        return selection.extract(text).rstrip(), "\n"
-
-    def render_line(self, y: int) -> Strip:
-        scroll_x, scroll_y = self.scroll_offset
-        row = scroll_y + y
-        selection = self.text_selection
-        if selection is not None and row < len(self.lines):
-            text = Text.assemble(*((segment.text, segment.style) for segment in self.lines[row]))
-            span = selection.get_span(row)
-            if span is not None:
-                start, end = span
-                text.stylize(
-                    self.screen.get_component_rich_style("screen--selection"),
-                    start,
-                    len(text) if end == -1 else end,
-                )
-            line = Strip(text.render(self.app.console))
-            line = line.crop_extend(
-                scroll_x, scroll_x + self.scrollable_content_region.width, self.rich_style
-            )
-        else:
-            line = super().render_line(y)
-        return line.apply_offsets(scroll_x, row)
-
     def on_click(self) -> None:
         if self.screen.get_selected_text():
             return
@@ -157,7 +130,13 @@ class TerminalPanel(RichLog):
         self.post_message(self.Selected(self.number))
 
     def on_key(self, event: events.Key) -> None:
-        key = event.character if event.character is not None else event.key
+        key = (
+            event.character
+            if event.character is not None
+            and event.character.isprintable()
+            and "+" not in event.key
+            else event.key
+        )
         event.stop()
         self.post_message(self.KeyPressed(self.number, key))
 
@@ -194,9 +173,13 @@ class TerminalHeading(Label):
             self.post_message(TerminalPanel.Selected(self.number))
 
 
-class HypervisorApp(App[None]):
+class HypervisorApp(App[None], inherit_bindings=False):
     TITLE = TEXT["app_title"]
     SUB_TITLE = TEXT["app_subtitle"]
+    ENABLE_COMMAND_PALETTE = False
+    ACTION_SCOPES: ClassVar[dict[str, str]] = {
+        spec.action.split("(", 1)[0]: spec.scope for spec in ACTIONS.values()
+    }
 
     CSS_PATH = Path(__file__).with_name("styles.tcss")
 
@@ -207,6 +190,7 @@ class HypervisorApp(App[None]):
     ]
 
     def __init__(self, backend: HypervisorBackend | None = None) -> None:
+        preserve_alt_with_associated_text()
         super().__init__()
         self.backend = backend or TmuxBackend()
         project = getattr(self.backend, "project_config", ProjectConfig.default())
@@ -217,6 +201,9 @@ class HypervisorApp(App[None]):
         self.selected_terminal = 1
         self.selected_terminal_state = TerminalState.MISSING
         self.fullscreen_terminal = False
+        self._event_log_selected = False
+        self._event_log_human = EVENT_LOG_HUMAN_READABLE
+        self._navigation_columns = 2
         self._refreshing = False
         self._current_group: GroupStatus | None = None
         self._resizing = False
@@ -270,6 +257,7 @@ class HypervisorApp(App[None]):
                 with Container(id="terminal-grid"):
                     for number in range(1, self._panel_count + 1):
                         yield self._terminal_wrapper(number)
+                    yield self._event_wrapper()
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -294,6 +282,23 @@ class HypervisorApp(App[None]):
         self._clipboard_executor.shutdown(wait=False, cancel_futures=True)
         self._workflow_executor.shutdown(wait=False, cancel_futures=True)
         self._mode_executor.shutdown(wait=False, cancel_futures=False)
+
+    def _event_wrapper(self) -> Vertical:
+        spec = ACTIONS["toggle_event_log_format"]
+        button = HypervisorButton(
+            EVENT_LOG_FORMAT_ICONS[self._event_log_human], id=spec.button_id, classes="icon-button"
+        )
+        button.tooltip = spec.tooltip if self._event_log_human else TEXT["event_log_human_tooltip"]
+        return Vertical(
+            Horizontal(
+                Label(TEXT["event_log_title"], classes="terminal-title"),
+                button,
+                classes="terminal-controls",
+            ),
+            WorkflowEventLog(human_readable=self._event_log_human),
+            id="event-log-wrap",
+            classes="terminal-wrapper",
+        )
 
     @staticmethod
     def _terminal_wrapper(number: int) -> Vertical:
@@ -347,8 +352,89 @@ class HypervisorApp(App[None]):
     @on(TerminalPanel.Selected)
     def select_terminal(self, event: TerminalPanel.Selected) -> None:
         self.selected_terminal = event.number
-        self._update_selection()
+        self._update_selection(enter_input=True)
         self.call_later(self.refresh_all)
+
+    @on(WorkflowEventLog.Selected)
+    def select_event_log(self) -> None:
+        self._event_log_selected = True
+        self._apply_fullscreen()
+        self.set_focus(self._main_query_one("#event-log", WorkflowEventLog), scroll_visible=False)
+
+    @on(Button.Pressed, "#event-log-format")
+    def action_toggle_event_log_format(self) -> None:
+        if self.selected_group is None:
+            return
+        self.screen.clear_selection()
+        log = self._main_query_one("#event-log", WorkflowEventLog)
+        position = log.scroll_y / max(1, log.max_scroll_y)
+        self._event_log_human = not self._event_log_human
+        log.set_format(self._event_log_human)
+        button = self._main_query_one("#event-log-format", Button)
+        button.label = EVENT_LOG_FORMAT_ICONS[self._event_log_human]
+        button.tooltip = (
+            ACTIONS["toggle_event_log_format"].tooltip
+            if self._event_log_human
+            else TEXT["event_log_human_tooltip"]
+        )
+        self._refresh_workflow(self.selected_group)
+        self.call_after_refresh(lambda: log.scroll_to(y=log.max_scroll_y * position, animate=False))
+        self.select_event_log()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        scope = self.ACTION_SCOPES.get(action)
+        if scope is None:
+            if isinstance(self.focused, TerminalPanel) and action in {
+                "focus_next",
+                "focus_previous",
+            }:
+                return False
+            return super().check_action(action, parameters)
+        if self._main_screen is not None and self.screen is not self._main_screen:
+            return False
+        if isinstance(self.focused, TerminalPanel):
+            return scope == "global"
+        if self._event_log_selected and action in {
+            "restart_terminal",
+            "stop_terminal",
+            "toggle_agent_mode",
+        }:
+            return False
+        return True
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        if self._unmounting:
+            return
+        modal = self._main_screen is not None and self.screen is not self._main_screen
+        key = ACTIONS["toggle_terminal_input"].keys.upper()
+        self.sub_title = TEXT[
+            "keyboard_dialog"
+            if modal
+            else "keyboard_input"
+            if isinstance(self.focused, TerminalPanel)
+            else "keyboard_events"
+            if isinstance(self.focused, WorkflowEventLog)
+            else "keyboard_manager"
+        ].format(key=key)
+        self.refresh_bindings()
+
+    def _focus_manager(self) -> None:
+        grid = self._main_query_one("#terminal-grid")
+        grid.can_focus = True
+        self.set_focus(grid, scroll_visible=False)
+
+    def action_toggle_terminal_input(self) -> None:
+        if self.selected_group is None:
+            return
+        if isinstance(self.focused, TerminalPanel):
+            self._flush_all_input()
+            self._focus_manager()
+        elif self._event_log_selected:
+            self.set_focus(
+                self._main_query_one("#event-log", WorkflowEventLog), scroll_visible=False
+            )
+        else:
+            self._update_selection(enter_input=True)
 
     @on(events.TextSelected)
     def copy_selected_text(self) -> None:
@@ -416,6 +502,8 @@ class HypervisorApp(App[None]):
 
     @on(Button.Pressed, ".terminal-controls .icon-button")
     def terminal_control_button(self, event: Button.Pressed) -> None:
+        if event.button.id == ACTIONS["toggle_event_log_format"].button_id:
+            return
         wrapper = event.button.parent.parent
         self.selected_terminal = int(wrapper.id.rsplit("-", 1)[1])
         self._update_selection()
@@ -541,11 +629,20 @@ class HypervisorApp(App[None]):
         workflow = getattr(self.backend, "workflow", None)
         if workflow is None or not callable(getattr(workflow, "status", None)):
             self._main_query_one("#workflow-row").styles.display = "none"
+            self._main_query_one("#event-log", WorkflowEventLog).update_events(group_id, [])
             return
         try:
-            status = workflow.status(group_id)
+            read_events = getattr(workflow, "events", None)
+            if callable(read_events):
+                events = read_events(group_id)
+                status = project_events(events)
+                self._main_query_one("#event-log", WorkflowEventLog).update_events(group_id, events)
+            else:
+                status = workflow.status(group_id)
+                self._main_query_one("#event-log", WorkflowEventLog).update_events(group_id, [])
         except Exception as error:
             LOGGER.warning("workflow status unavailable for %s: %s", group_id, error)
+            self._main_query_one("#event-log", WorkflowEventLog).show_error(group_id, error)
             return
         self._apply_workflow_status(group_id, status, None)
 
@@ -722,7 +819,10 @@ class HypervisorApp(App[None]):
         self._main_screen.clear_selection()
         grid = self._main_query_one("#terminal-grid", Container)
         await grid.remove_children()
-        await grid.mount(*(self._terminal_wrapper(number) for number in range(1, count + 1)))
+        await grid.mount(
+            *(self._terminal_wrapper(number) for number in range(1, count + 1)),
+            self._event_wrapper(),
+        )
         self._panel_count = count
         self.selected_terminal = min(self.selected_terminal, count)
 
@@ -735,6 +835,7 @@ class HypervisorApp(App[None]):
         self._main_query_one("#terminal-grid").styles.display = "block" if has_group else "none"
         self._main_query_one("#workflow-row").styles.display = "block" if has_group else "none"
         if group is None:
+            self._main_query_one("#event-log", WorkflowEventLog).update_events(None, [])
             self.selected_terminal_state = TerminalState.MISSING
             self._workflow_status = None
             self._main_query_one("#workflow-row").styles.display = "none"
@@ -792,22 +893,17 @@ class HypervisorApp(App[None]):
                 )
                 panel.update(
                     Text(
-                        TEXT["terminal_inactive"].format(activate_key=TEXT["activate_key"]),
+                        TEXT["terminal_inactive"],
                         style="dim",
                     )
                 )
             elif status.state is TerminalState.STOPPED:
-                panel.update(
-                    Text(
-                        TEXT["terminal_stopped"].format(start_key=TEXT["start_key"]), style="yellow"
-                    )
-                )
+                panel.update(Text(TEXT["terminal_stopped"], style="yellow"))
             elif status.state is TerminalState.EXITED:
                 panel.update(
                     Text(
                         TEXT["terminal_exited"].format(
                             exit_code=status.exit_code,
-                            start_key=TEXT["start_key"],
                         ),
                         style="red",
                     )
@@ -1027,11 +1123,19 @@ class HypervisorApp(App[None]):
         self.push_screen(ConfirmRemoveScreen(group_id), confirmed)
 
     def action_next_terminal(self) -> None:
-        self.selected_terminal = self.selected_terminal % self._panel_count + 1
-        self._update_selection()
+        self.action_select_terminal(self.selected_panel % (self._panel_count + 1) + 1)
+
+    @property
+    def selected_panel(self) -> int:
+        return self._panel_count + 1 if self._event_log_selected else self.selected_terminal
 
     def action_select_terminal(self, number: int) -> None:
-        if not 1 <= number <= self._panel_count:
+        if not 1 <= number <= self._panel_count + 1 or self.selected_group is None:
+            return
+        if number == self._panel_count + 1:
+            self.select_event_log()
+            if not self.fullscreen_terminal:
+                self._main_query_one("#event-log-wrap").scroll_visible(animate=False)
             return
         self.selected_terminal = number
         self._update_selection()
@@ -1053,32 +1157,46 @@ class HypervisorApp(App[None]):
             self.notify(str(error), severity="error", timeout=6)
 
     def action_previous_terminal(self) -> None:
-        self.selected_terminal = (self.selected_terminal - 2) % self._panel_count + 1
-        self._update_selection()
+        self.action_select_terminal((self.selected_panel - 2) % (self._panel_count + 1) + 1)
 
-    def _update_selection(self) -> None:
-        for number in range(1, self._panel_count + 1):
-            self._main_query_one(f"#terminal-{number}").set_class(
-                number == self.selected_terminal, "selected"
-            )
-            self._main_query_one(f"#terminal-wrap-{number}").set_class(
-                number == self.selected_terminal, "selected"
-            )
-            controls_row = self._main_query_one(f"#terminal-wrap-{number}").query_one(
-                ".terminal-controls"
-            )
-            controls_row.styles.display = "block"
-            for control in controls_row.query(Button):
-                control.styles.display = "block" if number == self.selected_terminal else "none"
+    def _update_selection(self, *, enter_input: bool = False) -> None:
+        if enter_input:
+            self.screen.clear_selection()
+        self._event_log_selected = False
         self._apply_fullscreen()
         if self._current_group is not None:
             state = self._current_group.terminals[self.selected_terminal - 1].state
             self.selected_terminal_state = state
             self._update_terminal_controls(state)
-        self._main_query_one(f"#terminal-{self.selected_terminal}", TerminalPanel).focus()
+        panel = self._main_query_one(f"#terminal-{self.selected_terminal}", TerminalPanel)
+        if enter_input or isinstance(self.focused, TerminalPanel):
+            panel.focus()
+        else:
+            self._focus_manager()
+        if not self.fullscreen_terminal:
+            self._main_query_one(f"#terminal-wrap-{self.selected_terminal}").scroll_visible(
+                animate=False
+            )
+
+    def action_move_terminal(self, direction: str) -> None:
+        index = self.selected_panel - 1
+        count = self._panel_count + 1
+        columns = self._navigation_columns
+        row = index // columns
+        offsets = {"up": -columns, "down": columns, "left": -1, "right": 1}
+        target = index + offsets[direction]
+        if direction == "down" and target >= count and (row + 1) * columns < count:
+            target = count - 1
+        if not 0 <= target < count:
+            return
+        if direction in {"left", "right"} and target // columns != row:
+            return
+        self.action_select_terminal(target + 1)
 
     def action_toggle_fullscreen(self) -> None:
         if self.selected_group is not None:
+            if not isinstance(self.focused, (TerminalPanel, WorkflowEventLog)):
+                self._focus_manager()
             self.fullscreen_terminal = not self.fullscreen_terminal
             self._apply_fullscreen()
 
@@ -1087,7 +1205,7 @@ class HypervisorApp(App[None]):
         sidebar.styles.display = "none" if self.fullscreen_terminal else "block"
         grid = self._main_query_one("#terminal-grid")
         grid.set_class(self.fullscreen_terminal, "fullscreen")
-        count = self._panel_count
+        count = self._panel_count + 1
         width = grid.content_size.width
         columns = (
             1
@@ -1095,6 +1213,8 @@ class HypervisorApp(App[None]):
             else (3 if count > 6 and width >= 150 else 2)
         )
         rows = 1 if self.fullscreen_terminal else (count + columns - 1) // columns
+        if not self.fullscreen_terminal:
+            self._navigation_columns = columns
         grid.styles.grid_size_columns = columns
         grid.styles.grid_size_rows = rows
         grid.styles.grid_columns = " ".join(["1fr"] * columns)
@@ -1102,24 +1222,25 @@ class HypervisorApp(App[None]):
             "8" if grid.content_size.height and grid.content_size.height < rows * 9 else "1fr"
         )
         grid.styles.grid_rows = " ".join([row_size] * rows)
-        for number in range(1, count + 1):
+        for number in range(1, self._panel_count + 1):
             wrapper = self._main_query_one(f"#terminal-wrap-{number}")
             panel = self._main_query_one(f"#terminal-{number}")
-            wrapper.styles.column_span = (
-                columns
-                if not self.fullscreen_terminal and number == count and count % columns == 1
-                else 1
-            )
-            wrapper.styles.display = (
-                "block"
-                if not self.fullscreen_terminal or number == self.selected_terminal
-                else "none"
-            )
-            panel.styles.display = (
-                "block"
-                if not self.fullscreen_terminal or number == self.selected_terminal
-                else "none"
-            )
+            wrapper.styles.column_span = 1
+            selected = not self._event_log_selected and number == self.selected_terminal
+            wrapper.set_class(selected, "selected")
+            panel.set_class(selected, "selected")
+            for control in wrapper.query(".terminal-controls Button"):
+                control.styles.display = "block" if selected else "none"
+            wrapper.styles.display = "block" if not self.fullscreen_terminal or selected else "none"
+            panel.styles.display = "block" if not self.fullscreen_terminal or selected else "none"
+        log_wrapper = self._main_query_one("#event-log-wrap")
+        log_wrapper.styles.column_span = (
+            columns if not self.fullscreen_terminal and count % columns == 1 else 1
+        )
+        log_wrapper.styles.display = (
+            "block" if not self.fullscreen_terminal or self._event_log_selected else "none"
+        )
+        log_wrapper.set_class(self._event_log_selected, "selected")
         self.call_after_refresh(self._sync_terminal_sizes)
 
     def _sync_terminal_sizes(self) -> None:
@@ -1238,13 +1359,13 @@ class HypervisorApp(App[None]):
         )
         self.push_screen(SessionPickerScreen(terminal, sessions, agent_name=label), chosen)
 
-    def action_next_group(self) -> None:
-        self._move_group(1)
+    async def action_next_group(self) -> None:
+        await self._move_group(1)
 
-    def action_previous_group(self) -> None:
-        self._move_group(-1)
+    async def action_previous_group(self) -> None:
+        await self._move_group(-1)
 
-    def _move_group(self, offset: int) -> None:
+    async def _move_group(self, offset: int) -> None:
         if not self.group_ids:
             return
         current = (
@@ -1253,7 +1374,17 @@ class HypervisorApp(App[None]):
             else 0
         )
         target = (current + offset) % len(self.group_ids)
-        self._main_query_one("#groups", ListView).index = target
+        await self.action_select_group(target + 1)
+
+    async def action_select_group(self, number: int) -> None:
+        if not 1 <= number <= len(self.group_ids):
+            return
+        self.screen.clear_selection()
+        self.selected_group = self.group_ids[number - 1]
+        self._main_query_one("#groups", ListView).index = number - 1
+        await self.refresh_all(rebuild_groups=False)
+        if isinstance(self.focused, TerminalPanel):
+            self._focus_manager()
 
 
 def run() -> None:

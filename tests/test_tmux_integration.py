@@ -11,6 +11,7 @@ from unittest.mock import Mock
 from uuid import uuid4
 
 from agent_hypervisor.models import AgentManualMode, TerminalState
+from agent_hypervisor.mcp_config import qwen_settings
 from agent_hypervisor.project_config import AgentSpec, FlowSpec, FlowStep, ProjectConfig
 from agent_hypervisor.state import StateStore
 from agent_hypervisor.tmux import TmuxBackend
@@ -21,6 +22,12 @@ from agent_hypervisor.tmux import TmuxBackend
 )
 class TmuxIntegrationTests(unittest.TestCase):
     def test_standalone_agent_cli_callbacks_finish_workflow_without_tui(self) -> None:
+        self._exercise_agent_callbacks("cli")
+
+    def test_standalone_agent_mcp_callbacks_finish_workflow_without_tui(self) -> None:
+        self._exercise_agent_callbacks("mcp")
+
+    def _exercise_agent_callbacks(self, transport: str) -> None:
         binary = os.environ["HYPERVISOR_TEST_TMUX"]
         socket = f"hypervisor-callback-{uuid4().hex[:12]}"
 
@@ -46,6 +53,38 @@ class TmuxIntegrationTests(unittest.TestCase):
             (wrapper / "tmux").chmod(0o755)
             program = base / "agent.py"
             log = base / "callbacks.log"
+            mcp_callback = base / "mcp_callback.py"
+            mcp_callback.write_text(
+                "import asyncio,os,sys,json\n"
+                "from mcp import ClientSession,StdioServerParameters\n"
+                "from mcp.client.stdio import stdio_client\n"
+                f"settings={qwen_settings()['mcpServers']['agent-hypervisor']!r}\n"
+                "async def main():\n"
+                " env={key:(os.environ[value[2:-1]] if value.startswith('${') else value) for key,value in settings['env'].items()}\n"
+                " params=StdioServerParameters(command=settings['command'],args=settings['args'],env={**os.environ,**env})\n"
+                " async with stdio_client(params) as (read,write):\n"
+                "  async with ClientSession(read,write) as client:\n"
+                "   await client.initialize()\n"
+                "   status=await client.call_tool('workflow_status',{})\n"
+                "   assert not status.isError,status\n"
+                "   assignment=status.structuredContent['latest_assignment']\n"
+                "   args={key:assignment[key] for key in ('step_id','attempt')}\n"
+                "   args['summary']='Completed via MCP'\n"
+                "   role=assignment['role']\n"
+                "   if role=='reviewer': args['decision']='approved'\n"
+                "   result=await client.call_tool('submit_review' if role=='reviewer' else 'complete_stage',args)\n"
+                "   print(json.dumps(result.structuredContent),flush=True)\n"
+                "   if result.isError:\n"
+                "    print(result,file=sys.stderr)\n"
+                "    raise SystemExit(1)\n"
+                "asyncio.run(main())\n",
+                encoding="utf-8",
+            )
+            callback = (
+                "shlex.split(command)"
+                if transport == "cli"
+                else f"[sys.executable,{str(mcp_callback)!r}]"
+            )
             # Deterministic terminal peer: exercises real child CLI processes and tmux,
             # without provider access or depending on model compliance in a test.
             program.write_text(
@@ -63,7 +102,7 @@ class TmuxIntegrationTests(unittest.TestCase):
                 " if 'WORKFLOW EXECUTION:' in prompt: Path('result.txt').write_text('done\\n')\n"
                 " command=next(line for line in prompt.splitlines() if line.startswith('env HYPERVISOR_STATE_PATH='))\n"
                 " for retry in range(10):\n"
-                "  result=subprocess.run(shlex.split(command),capture_output=True,text=True)\n"
+                f"  result=subprocess.run({callback},capture_output=True,text=True)\n"
                 "  if 'Another workflow operation' not in result.stderr: break\n"
                 "  time.sleep(0.1)\n"
                 " with open(sys.argv[2],'a') as log: log.write('CALLBACK DONE '+str(result.returncode)+' '+result.stdout+result.stderr+'\\n')\n",
@@ -93,7 +132,7 @@ class TmuxIntegrationTests(unittest.TestCase):
                 self.assertEqual(backend.workflow.start("TEST")["state"], "waiting-manual")
                 self.assertFalse(backend.status("TEST").active)
                 backend.workflow.set_agent_mode("TEST", "worker", "workflow")
-                deadline = time.monotonic() + 20
+                deadline = time.monotonic() + 30
                 while (
                     time.monotonic() < deadline
                     and backend.workflow.status("TEST")["state"] != "completed"

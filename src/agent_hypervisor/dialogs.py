@@ -164,10 +164,20 @@ class GroupContextScreen(HypervisorDialog[dict[str, object] | None]):
                     if field.required
                     else field.label
                 )
-                if field.field_id == "sources":
-                    yield Input(value=", ".join(field.default), id=f"context-{field.field_id}")
+                if field.description:
+                    yield Static(field.description, classes="context-description", markup=False)
+                if field.input_type == "text":
+                    yield Input(
+                        value=field.display_value(),
+                        placeholder=field.placeholder,
+                        id=f"context-{field.field_id}",
+                    )
                 else:
-                    yield TextArea(str(field.default), id=f"context-{field.field_id}")
+                    yield TextArea(
+                        field.display_value(),
+                        placeholder=field.placeholder,
+                        id=f"context-{field.field_id}",
+                    )
             with Horizontal(id="create-actions"):
                 yield HypervisorButton(TEXT["cancel"], id="cancel")
                 yield HypervisorButton(TEXT["create"], id="confirm")
@@ -177,10 +187,8 @@ class GroupContextScreen(HypervisorDialog[dict[str, object] | None]):
         for field in self.fields:
             if not field.visible:
                 continue
-            if field.field_id == "sources":
-                values[field.field_id] = tuple(
-                    self.query_one(f"#context-{field.field_id}", Input).value.split(",")
-                )
+            if field.input_type == "text":
+                values[field.field_id] = self.query_one(f"#context-{field.field_id}", Input).value
             else:
                 values[field.field_id] = self.query_one(f"#context-{field.field_id}", TextArea).text
         return resolve_task_context(self.fields, values)
